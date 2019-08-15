@@ -1,9 +1,10 @@
 import time
 
 from sqlalchemy import desc
+from sqlalchemy import and_, or_
 
 from anchore_engine import db
-from anchore_engine.db import CatalogImageDocker
+from anchore_engine.db import CatalogImageDocker, CatalogImage
 from anchore_engine.subsys import logger
 
 def update_record(record, session=None):
@@ -45,8 +46,6 @@ def add(imageDigest, userId, tag, registry=None, user=None, repo=None, digest=No
     our_result = session.query(CatalogImageDocker).filter_by(imageDigest=imageDigest, userId=userId, tag=tag).first()
     if not our_result:
         our_result = CatalogImageDocker(imageDigest=imageDigest, userId=userId, tag=tag)
-        #dbobj['created_at'] = int(time.time())
-
         our_result.update(dbobj)
         session.add(our_result)
     else:
@@ -67,7 +66,7 @@ def get_byfilter(userId, session=None, **kwargs):
     
     results = session.query(CatalogImageDocker).filter_by(**kwargs).order_by(desc(CatalogImageDocker.created_at))
     for result in results:
-        dbobj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+        dbobj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
         ret.append(dbobj)
 
     return(ret)
@@ -81,7 +80,7 @@ def get_alltags(imageDigest, userId, session=None):
     results = session.query(CatalogImageDocker).filter_by(imageDigest=imageDigest, userId=userId)
     if results:
         for result in results:
-            dbobj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+            dbobj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
             #dbobj = result.__dict__
             #dbobj.pop('_sa_instance_state', None)
             ret.append(dbobj)
@@ -96,7 +95,7 @@ def get(imageDigest, userId, tag, session=None):
 
     result = session.query(CatalogImageDocker).filter_by(imageDigest=imageDigest, userId=userId, tag=tag).first()
     if result:
-        dbobj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+        dbobj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
         ret = dbobj
 
     return(ret)
@@ -110,7 +109,7 @@ def get_all(userId, session=None):
     results = session.query(CatalogImageDocker).filter_by(userId=userId)
     if results:
         for result in results:
-            dbobj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+            dbobj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
             ret.append(dbobj)
             
     return(ret)
@@ -120,3 +119,68 @@ def delete(imageDigest, userId, tag, session=None):
         session = db.Session
 
     return(True)
+
+
+def get_tag_histories(session, userId, registries=None, repositories=None, tags=None):
+    """
+    registries, repositories, and tags are lists of filter strings (wildcard '*' allowed)
+
+    Returns a query to iterate over matches in tag sorted ascending, and tag date descending order
+    :param session:
+    :param userId:
+    :param registries:
+    :param repositories:
+    :param tags:
+    :return: constructed query to execute/iterate over that returns tuples of (CatalogImageDocker, CatalogImage) that match userId/account and digest
+    """
+
+    # select_fields = [
+    #     CatalogImageDocker.userId,
+    #     CatalogImageDocker.imageDigest,
+    #     CatalogImageDocker.registry,
+    #     CatalogImageDocker.repo,
+    #     CatalogImageDocker.tag,
+    #     CatalogImageDocker.tag_detected_at,
+    #     CatalogImage.analyzed_at
+    #     ]
+
+    select_fields = [
+        CatalogImageDocker,
+        CatalogImage
+    ]
+
+    order_by_fields = [
+        CatalogImageDocker.registry.asc(),
+        CatalogImageDocker.repo.asc(),
+        CatalogImageDocker.tag.asc(),
+        CatalogImageDocker.tag_detected_at.desc()
+    ]
+
+    qry = session.query(*select_fields).join(CatalogImage, and_(CatalogImageDocker.userId == CatalogImage.userId, CatalogImageDocker.imageDigest == CatalogImage.imageDigest)).filter(CatalogImage.userId==userId).order_by(*order_by_fields)
+
+    for field, filters in [(CatalogImageDocker.registry, registries), (CatalogImageDocker.repo, repositories), (CatalogImageDocker.tag, tags)]:
+        if filters:
+            wildcarded = []
+            exact = []
+            for r in filters:
+                if r.strip() == '*':
+                    continue
+
+                if '*' in r:
+                    wildcarded.append(r)
+                else:
+                    exact.append(r)
+
+            conditions = []
+            if wildcarded:
+                for w in wildcarded:
+                    conditions.append(field.like(w.replace('*', '%')))
+
+            if exact:
+                conditions.append(field.in_(exact))
+
+            if conditions:
+                qry = qry.filter(or_(*conditions))
+
+    logger.debug('Constructed tag history query: {}'.format(qry))
+    return qry

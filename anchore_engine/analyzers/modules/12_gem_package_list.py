@@ -1,13 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import sys
 import os
-import shutil
 import re
 import json
-import time
-import rpm
-import subprocess
+import tarfile
 
 import anchore_engine.analyzers.utils
 
@@ -16,16 +13,13 @@ analyzer_name = "package_list"
 try:
     config = anchore_engine.analyzers.utils.init_analyzer_cmdline(sys.argv, analyzer_name)
 except Exception as err:
-    print str(err)
+    print(str(err))
     sys.exit(1)
 
 imgname = config['imgid']
 imgid = imgname
 outputdir = config['dirs']['outputdir']
 unpackdir = config['dirs']['unpackdir']
-
-#if not os.path.exists(outputdir):
-#    os.makedirs(outputdir)
 
 pkglist = {}
 
@@ -35,23 +29,30 @@ try:
         with open(unpackdir + "/anchore_allfiles.json", 'r') as FH:
             allfiles = json.loads(FH.read())
     else:
-        fmap, allfiles = anchore_engine.analyzers.utils.get_files_from_path(unpackdir + "/rootfs")
+        fmap, allfiles = anchore_engine.analyzers.utils.get_files_from_squashtar(os.path.join(unpackdir, "squashed.tar"))
         with open(unpackdir + "/anchore_allfiles.json", 'w') as OFH:
             OFH.write(json.dumps(allfiles))
 
-    for tfile in allfiles.keys():
-        patt = re.match(".*specifications.*\.gemspec$", tfile)
-        if patt:
-            thefile = '/'.join([unpackdir, 'rootfs', tfile])
-            try:
-                with open(thefile, 'r') as FH:
-                    pdata = FH.read().decode('utf8')
-                    precord = anchore_engine.analyzers.utils.gem_parse_meta(pdata)
-                    for k in precord.keys():
-                        record = precord[k]
-                        pkglist[tfile] = json.dumps(record)
-            except Exception as err:
-                print "WARN: found gemspec but cannot parse (" + str(tfile) +") - exception: " + str(err)
+    with tarfile.open(os.path.join(unpackdir, "squashed.tar"), mode='r', format=tarfile.PAX_FORMAT) as tfl:
+        memberhash = anchore_engine.analyzers.utils.get_memberhash(tfl)
+
+        for tfile in list(allfiles.keys()):
+            patt = re.match(".*specifications.*\.gemspec$", tfile)
+            if patt:
+                thefile = re.sub("^/+", "", tfile)
+                try:
+                    basemember = memberhash.get(thefile)
+                    member = anchore_engine.analyzers.utils._get_extractable_member(tfl, basemember, memberhash=memberhash)
+                    with tfl.extractfile(member) as FH:
+                        pdata = str(FH.read(), 'utf-8')
+                        precord = anchore_engine.analyzers.utils.gem_parse_meta(pdata)
+                        for k in list(precord.keys()):
+                            record = precord[k]
+                            pkglist[tfile] = json.dumps(record)
+                except Exception as err:
+                    import traceback
+                    traceback.print_exc()
+                    print("WARN: found gemspec but cannot parse (" + str(tfile) +") - exception: " + str(err))
 
 except Exception as err:
     import traceback

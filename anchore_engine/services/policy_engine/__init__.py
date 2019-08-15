@@ -1,30 +1,25 @@
 import time
 import sys
-import traceback
-import connexion
+import pkg_resources
+import os
+import retrying
 
-from twisted import internet
-from twisted.internet import reactor
-from twisted.web.wsgi import WSGIResource
-from twisted.web.resource import Resource
-from twisted.web import rewrite
-from twisted.internet.task import LoopingCall
+from sqlalchemy.exc import IntegrityError
 
 # anchore modules
-import anchore_engine.services.common
-import anchore_engine.clients.common
+import anchore_engine.clients.services.common
 import anchore_engine.subsys.servicestatus
-import anchore_engine.subsys.taskstate
 import anchore_engine.subsys.metrics
-import anchore_engine.clients.catalog
 from anchore_engine.subsys import logger
 from anchore_engine.configuration import localconfig
-from anchore_engine.clients import simplequeue
+from anchore_engine.clients.services import simplequeue, internal_client_for
+from anchore_engine.clients.services.simplequeue import SimpleQueueClient
+from anchore_engine.service import ApiService, LifeCycleStages
 
-servicename = 'policy_engine'
-_default_api_version = "v1"
+# from anchore_engine.subsys.logger import enable_bootstrap_logging
+# enable_bootstrap_logging()
 
-temp_logger = None
+
 feed_sync_queuename = 'feed_sync_tasks'
 system_user_auth = None
 feed_sync_msg = {
@@ -32,120 +27,57 @@ feed_sync_msg = {
     'enabled': True
 }
 
+try:
+    FEED_SYNC_RETRIES = int(os.getenv('ANCHORE_FEED_SYNC_CHECK_RETRIES', 5))
+except:
+    logger.exception('Error parsing env value ANCHORE_FEED_SYNC_CHECK_RETRIES into int, using default value of 5')
+    FEED_SYNC_RETRIES = 5
+
+try:
+    FEED_SYNC_RETRY_BACKOFF = int(os.getenv('ANCHORE_FEED_SYNC_CHECK_FAILURE_BACKOFF', 5))
+except:
+    logger.exception('Error parsing env value ANCHORE_FEED_SYNC_CHECK_FAILURE_BACKOFF into int, using default value of 5')
+    FEED_SYNC_RETRY_BACKOFF = 5
+
+try:
+    feed_config_check_retries = int(os.getenv('FEED_CLIENT_CHECK_RETRIES', 3))
+except:
+    logger.exception('Error parsing env value FEED_CLIENT_CHECK_RETRIES into int, using default value of 3')
+    feed_config_check_retries = 3
+
+try:
+    feed_config_check_backoff = int(os.getenv('FEED_CLIENT_CHECK_BACKOFF', 5))
+except:
+    logger.exception('Error parsing env FEED_CLIENT_CHECK_BACKOFF value into int, using default value of 5')
+    feed_config_check_backoff = 5
+
 # service funcs (must be here)
 
-def default_version_rewrite(request):
-    global _default_api_version
-    try:
-        if request.postpath:
-            if request.postpath[0] != 'health' and request.postpath[0] != _default_api_version:
-                request.postpath.insert(0, _default_api_version)
-                request.path = '/'+_default_api_version+request.path
-    except Exception as err:
-        logger.error("rewrite exception: " +str(err))
-        raise err
-
-def createService(sname, config):
-    global monitor_threads, monitors, servicename
-
-    try:
-        application = connexion.FlaskApp(__name__, specification_dir='swagger/')
-        flask_app = application.app
-        flask_app.url_map.strict_slashes = False
-        anchore_engine.subsys.metrics.init_flask_metrics(flask_app, servicename=servicename)
-        application.add_api('swagger.yaml')
-    except Exception as err:
-        traceback.print_exc()
-        raise err
-
-    try:
-        myconfig = config['services'][sname]
-        servicename = sname
-    except Exception as err:
-        raise err
-
-    try:
-        kick_timer = int(myconfig['cycle_timer_seconds'])
-    except:
-        kick_timer = 1
-
-    doapi = False
-    try:
-        if myconfig['listen'] and myconfig['port'] and myconfig['endpoint_hostname']:
-            doapi = True
-    except:
-        doapi = False
-
-    try:
-        cycle_timers = {}
-        cycle_timers.update(config['services'][sname]['cycle_timers'])
-    except:
-        cycle_timers = {}
-
-    kwargs = {}
-    kwargs['kick_timer'] = kick_timer
-    kwargs['monitors'] = monitors
-    kwargs['monitor_threads'] = monitor_threads
-    kwargs['servicename'] = servicename
-    kwargs['cycle_timers'] = cycle_timers
-
-    if doapi:
-        # start up flask service
-
-        flask_site = WSGIResource(reactor, reactor.getThreadPool(), application=flask_app)
-        realroot = Resource()
-        realroot.putChild(b"v1", anchore_engine.services.common.getAuthResource(flask_site, sname, config))
-        realroot.putChild(b"health", anchore_engine.services.common.HealthResource())
-        # this will rewrite any calls that do not have an explicit version to the base path before being processed by flask
-        root = rewrite.RewriterResource(realroot, default_version_rewrite)
-        #root = anchore_engine.services.common.getAuthResource(flask_site, sname, config)
-        ret_svc = anchore_engine.services.common.createServiceAPI(root, sname, config)
-
-        # start up the monitor as a looping call
-        lc = LoopingCall(anchore_engine.services.common.monitor, **kwargs)
-        lc.start(1)
-    else:
-        # start up the monitor as a timer service
-        svc = internet.TimerService(1, anchore_engine.services.common.monitor, **kwargs)
-        svc.setName(sname)
-        ret_svc = svc
-
-    return (ret_svc)
-
-
-def initializeService(sname, config):
-    service_record = {'hostid': config['host_id'], 'servicename': sname}
-    try:
-        if not anchore_engine.subsys.servicestatus.has_status(service_record):
-            anchore_engine.subsys.servicestatus.initialize_status(service_record, up=True, available=False, message='initializing')
-    except Exception as err:
-        import traceback
-        traceback.print_exc()
-        raise Exception("could not initialize service status - exception: " + str(err))
-
-    return anchore_engine.services.common.initializeService(sname, config)
-
-
-def registerService(sname, config):
-    reg_return = anchore_engine.services.common.registerService(sname, config, enforce_unique=False)
-    logger.info('Registration complete.')
-
-    if reg_return:
-        process_preflight()
-
-    service_record = {'hostid': config['host_id'], 'servicename': sname}
-    anchore_engine.subsys.servicestatus.set_status(service_record, up=True, available=True, detail={'service_state': anchore_engine.subsys.taskstate.complete_state('policy_engine_state')}, update_db=True)
-
-    return reg_return
-
-
 def _check_feed_client_credentials():
-    from anchore_engine.clients.feeds.feed_service.feeds import get_client
-    logger.info('Checking feeds client credentials')
-    client = get_client()
-    client = None
-    logger.info('Feeds client credentials ok')
+    from anchore_engine.clients.feeds.feed_service import get_client
+    sleep_time = feed_config_check_backoff
+    last_ex = None
 
+    for i in range(feed_config_check_retries):
+        if i > 0:
+            logger.info("Waiting for {} seconds to try feeds client config check again".format(sleep_time))
+            time.sleep(sleep_time)
+            sleep_time += feed_config_check_backoff
+
+        try:
+            logger.info('Checking feeds client credentials. Attempt {} of {}'.format(i + 1, feed_config_check_retries))
+            client = get_client()
+            client = None
+            logger.info('Feeds client credentials ok')
+            return True
+        except Exception as e:
+            logger.warn("Could not verify feeds endpoint and/or config. Got exception: {}".format(e))
+            last_ex = e
+    else:
+        if last_ex:
+            raise last_ex
+        else:
+            raise Exception('Exceeded retries for feeds client config check. Failing check')
 
 def _system_creds():
     global system_user_auth
@@ -163,16 +95,14 @@ def process_preflight():
 
     :return:
     """
-    preflight_check_functions = [
-        _check_feed_client_credentials,
-        _init_db_content
-    ]
+
+    preflight_check_functions = [_init_db_content]
 
     for fn in preflight_check_functions:
         try:
             fn()
         except Exception as e:
-            logger.error('Preflight checks failed with error: {}. Aborting service startup'.format(e))
+            logger.exception('Preflight checks failed with error: {}. Aborting service startup'.format(e))
             sys.exit(1)
 
 
@@ -187,23 +117,33 @@ def _init_distro_mappings():
         DistroMapping(from_distro='fedora', to_distro='centos', flavor='RHEL'),
         DistroMapping(from_distro='ol', to_distro='ol', flavor='RHEL'),
         DistroMapping(from_distro='rhel', to_distro='centos', flavor='RHEL'),
-        DistroMapping(from_distro='ubuntu', to_distro='ubuntu', flavor='DEB')
+        DistroMapping(from_distro='ubuntu', to_distro='ubuntu', flavor='DEB'),
+        DistroMapping(from_distro='amzn', to_distro='amzn', flavor='RHEL'),
+        #DistroMapping(from_distro='java', to_distro='snyk', flavor='JAVA'),
+        #DistroMapping(from_distro='gem', to_distro='snyk', flavor='RUBY'),
+        #DistroMapping(from_distro='npm', to_distro='snyk', flavor='NODEJS'),
+        #DistroMapping(from_distro='python', to_distro='snyk', flavor='PYTHON'),
     ]
 
     # set up any data necessary at system init
     try:
         logger.info('Checking policy engine db initialization. Checking initial set of distro mappings')
+
         with session_scope() as dbsession:
             distro_mappings = dbsession.query(DistroMapping).all()
 
             for i in initial_mappings:
-                if not filter(lambda x: x.from_distro == i.from_distro, distro_mappings):
+                if not [x for x in distro_mappings if x.from_distro == i.from_distro]:
                     logger.info('Adding missing mapping: {}'.format(i))
                     dbsession.add(i)
 
         logger.info('Distro mapping initialization complete')
     except Exception as err:
-        raise Exception("unable to initialize default distro mappings - exception: " + str(err))
+
+        if isinstance(err, IntegrityError):
+            logger.warn("another process has already initialized, continuing")
+        else:
+            raise Exception("unable to initialize default distro mappings - exception: " + str(err))
 
     return True
 
@@ -261,22 +201,38 @@ def handle_feed_sync(*args, **kwargs):
     cycle_time = kwargs['mythread']['cycle_timer']
 
     while True:
-
-        try:
-            all_ready = anchore_engine.clients.common.check_services_ready(['simplequeue'])
-            if not all_ready:
-                logger.info("simplequeue service not yet ready, will retry")
-            else:
-                try:
-                    simplequeue.run_target_with_queue_ttl(system_user, queue=feed_sync_queuename, target=do_feed_sync, max_wait_seconds=30, visibility_timeout=180)
-                except Exception as err:
-                    logger.warn("failed to process task this cycle: " + str(err))
-        except Exception as e:
-            logger.error('Caught escaped error in feed sync handler: {}'.format(e))
+        config = localconfig.get_config()
+        feed_sync_enabled = config.get('feeds', {}).get('sync_enabled', True)
+        if feed_sync_enabled:
+            logger.info("Feed sync task executor activated")
+            try:
+                run_feed_sync(system_user)
+            except Exception as e:
+                logger.error('Caught escaped error in feed sync handler: {}'.format(e))
+            finally:
+                logger.info('Feed sync task executor complete')
+        else:
+            logger.info("sync_enabled is set to false in config - skipping feed sync")
 
         time.sleep(cycle_time)
 
     return True
+
+
+@retrying.retry(stop_max_attempt_number=FEED_SYNC_RETRIES, wait_incrementing_start=FEED_SYNC_RETRY_BACKOFF * 1000, wait_incrementing_increment=FEED_SYNC_RETRY_BACKOFF * 1000)
+def run_feed_sync(system_user):
+    all_ready = anchore_engine.clients.services.common.check_services_ready(['simplequeue'])
+    if not all_ready:
+        logger.info("simplequeue service not yet ready, will retry")
+        raise Exception('Simplequeue service not yet ready')
+    else:
+        try:
+            # This has its own retry on the queue fetch, so wrap with catch block to ensure we don't double-retry on task exec
+            simplequeue.run_target_with_queue_ttl(None, queue=feed_sync_queuename, target=do_feed_sync,
+                                                  max_wait_seconds=30, visibility_timeout=180, retries=FEED_SYNC_RETRIES,
+                                                  backoff_time=FEED_SYNC_RETRY_BACKOFF)
+        except Exception as err:
+            logger.warn("failed to process task this cycle: " + str(err))
 
 
 def handle_feed_sync_trigger(*args, **kwargs):
@@ -294,30 +250,56 @@ def handle_feed_sync_trigger(*args, **kwargs):
     cycle_time = kwargs['mythread']['cycle_timer']
 
     while True:
-        try:
-            all_ready = anchore_engine.clients.common.check_services_ready(['simplequeue'])
-            if not all_ready:
-                logger.info("simplequeue service not yet ready, will retry")
-            else:
-                logger.info('Feed Sync Trigger activated')
-                if not simplequeue.is_inqueue(userId=system_user, name=feed_sync_queuename, inobj=feed_sync_msg):
-                    try:
-                        simplequeue.enqueue(userId=system_user, name=feed_sync_queuename, inobj=feed_sync_msg)
-                    except:
-                        logger.exception('Could not enqueue message for a feed sync')
+        config = localconfig.get_config()
+        feed_sync_enabled = config.get('feeds', {}).get('sync_enabled', True)
+        if feed_sync_enabled:
+            logger.info('Feed Sync task creator activated')
+            try:
+                push_sync_task(system_user)
                 logger.info('Feed Sync Trigger done, waiting for next cycle.')
-        except Exception as e:
-            logger.exception('Error caught in feed sync trigger handler. Will continue. Exception: {}'.format(e))
+            except Exception as e:
+                logger.error('Error caught in feed sync trigger handler after all retries. Will wait for next cycle')
+            finally:
+                logger.info('Feed Sync task creator complete')
+        else:
+            logger.info("sync_enabled is set to false in config - skipping feed sync trigger")
 
         time.sleep(cycle_time)
 
     return True
 
 
-# monitor infrastructure
-monitors = {
-    'service_heartbeat': {'handler': anchore_engine.subsys.servicestatus.handle_service_heartbeat, 'taskType': 'handle_service_heartbeat', 'args': [servicename], 'cycle_timer': 60, 'min_cycle_timer': 60, 'max_cycle_timer': 60, 'last_queued': 0, 'last_return': False, 'initialized': False},
-    'feed_sync_checker': {'handler': handle_feed_sync_trigger, 'taskType': 'handle_feed_sync_trigger', 'args': [], 'cycle_timer': 600, 'min_cycle_timer': 300, 'max_cycle_timer': 100000, 'last_queued': 0, 'last_return': False, 'initialized': False},
-    'feed_sync': {'handler': handle_feed_sync, 'taskType': 'handle_feed_sync', 'args': [], 'cycle_timer': 3600, 'min_cycle_timer': 1800, 'max_cycle_timer': 100000, 'last_queued': 0, 'last_return': False, 'initialized': False},
-}
-monitor_threads = {}
+@retrying.retry(stop_max_attempt_number=FEED_SYNC_RETRIES, wait_incrementing_start=FEED_SYNC_RETRY_BACKOFF * 1000, wait_incrementing_increment=FEED_SYNC_RETRY_BACKOFF * 1000)
+def push_sync_task(system_user):
+    all_ready = anchore_engine.clients.services.common.check_services_ready(['simplequeue'])
+
+    if not all_ready:
+        logger.info("simplequeue service not yet ready, will retry")
+        raise Exception("Simplequeue service not yet ready")
+    else:
+        #q_client = SimpleQueueClient(user=system_user[0], password=system_user[1])
+        q_client = internal_client_for(SimpleQueueClient, userId=None)
+        if not q_client.is_inqueue(name=feed_sync_queuename, inobj=feed_sync_msg):
+            try:
+                q_client.enqueue(name=feed_sync_queuename, inobj=feed_sync_msg)
+            except:
+                logger.error('Could not enqueue message for a feed sync')
+                raise
+
+
+class PolicyEngineService(ApiService):
+    __service_name__ = 'policy_engine'
+    __spec_dir__ = pkg_resources.resource_filename(__name__, 'swagger')
+    __monitors__ = {
+        'service_heartbeat': {'handler': anchore_engine.subsys.servicestatus.handle_service_heartbeat, 'taskType': 'handle_service_heartbeat', 'args': [__service_name__], 'cycle_timer': 60, 'min_cycle_timer': 60, 'max_cycle_timer': 60, 'last_queued': 0, 'last_return': False, 'initialized': False},
+        'feed_sync_checker': {'handler': handle_feed_sync_trigger, 'taskType': 'handle_feed_sync_trigger', 'args': [], 'cycle_timer': 600, 'min_cycle_timer': 300, 'max_cycle_timer': 100000, 'last_queued': 0, 'last_return': False, 'initialized': False},
+        'feed_sync': {'handler': handle_feed_sync, 'taskType': 'handle_feed_sync', 'args': [], 'cycle_timer': 3600, 'min_cycle_timer': 1800, 'max_cycle_timer': 100000, 'last_queued': 0, 'last_return': False, 'initialized': False}
+    }
+
+    __lifecycle_handlers__ = {
+        LifeCycleStages.pre_register: [(process_preflight, None)]
+    }
+
+    #def _register_instance_handlers(self):
+    #    super()._register_instance_handlers()
+    #    self.register_handler(LifeCycleStages.pre_register, process_preflight, None)

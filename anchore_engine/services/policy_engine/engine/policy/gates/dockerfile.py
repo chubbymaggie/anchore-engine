@@ -80,10 +80,10 @@ class ParameterizedDockerfileModeBaseTrigger(BaseTrigger):
 
 class EffectiveUserTrigger(DockerfileModeCheckedBaseTrigger):
     __trigger_name__ = 'effective_user'
-    __description__ = 'Checks if the effective user matches the provided user names and fires based on the allowed parameter. If allowed=true, the rule behaves as a whitelist, otherwise acts as a blacklist.'
+    __description__ = 'Checks if the effective user matches the provided user names, either as a whitelist or blacklist depending on the type parameter setting.'
 
     user = CommaDelimitedStringListParameter(name='users', example_str='root,docker', description='User names to check against as the effective user (last user entry) in the images history.', is_required=True, validator=TypeValidator('string'), sort_order=1)
-    allowed_type = EnumStringParameter(name='type', enum_values=['whitelist', 'blacklist'], description='How to treat the provided user names.', is_required=True, sort_order=2)
+    allowed_type = EnumStringParameter(name='type', enum_values=['whitelist', 'blacklist'], example_str='blacklist', description='How to treat the provided user names.', is_required=True, sort_order=2)
 
     _sanitize_regex = '\s*USER\s+\[?([^\]]+)\]?\s*'
 
@@ -148,13 +148,13 @@ class InstructionCheckTrigger(ParameterizedDockerfileModeBaseTrigger):
 
         df = context.data.get('prepared_dockerfile')
 
-        for directive_name, lines in filter(lambda x: x[0] == directive, df.items()):
+        for directive_name, lines in [x for x in list(df.items()) if x[0] == directive]:
             for l in lines:
                 l = l[len(directive_name):].strip()
                 if operation(l, check_value):
                     self._fire(msg="Dockerfile directive '{}' check '{}' matched against '{}' for line '{}'".format(directive_name, condition, check_value if check_value else '', l))
 
-        upper_keys = set(map(lambda x: x.upper(), df.keys()))
+        upper_keys = set([x.upper() for x in list(df.keys())])
         if condition == 'not_exists' and directive not in upper_keys:
             self._fire(msg="Dockerfile directive '{}' not found, matching condition '{}' check".format(directive, condition))
 
@@ -164,7 +164,7 @@ class ExposedPortsTrigger(ParameterizedDockerfileModeBaseTrigger):
     __description__ = 'Evaluates the set of ports exposed. Allows configuring whitelist or blacklist behavior. If type=whitelist, then any ports found exposed that are not in the list will cause the trigger to fire. If type=blacklist, then any ports exposed that are in the list will cause the trigger to fire.'
 
     ports = CommaDelimitedNumberListParameter(name='ports', example_str='80,8080,8088', description='List of port numbers.', is_required=True, sort_order=1)
-    allowed_type = EnumStringParameter(name='type', example_str='false', enum_values=['whitelist', 'blacklist'], description='Whether to use port list as a whitelist or blacklist.', is_required=True, sort_order=2)
+    allowed_type = EnumStringParameter(name='type', example_str='blacklist', enum_values=['whitelist', 'blacklist'], description='Whether to use port list as a whitelist or blacklist.', is_required=True, sort_order=2)
 
     def _evaluate(self, image_obj, context):
         if self.allowed_type.value().lower() == 'whitelist':
@@ -283,7 +283,12 @@ class DockerfileGate(Gate):
                     else:
                         linebuf = linebuf + line
                         if linebuf:
-                            directive, remainder = linebuf.split(' ', 1)
+                            tokens = linebuf.split(' ', 1)
+                            if tokens:
+                                directive = tokens[0]
+                            else:
+                                directive = ''
+
                             directive = directive.upper()
                             if directive not in context.data['prepared_dockerfile']:
                                 context.data['prepared_dockerfile'][directive] = []

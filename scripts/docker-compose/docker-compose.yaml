@@ -1,43 +1,24 @@
-# example docker-compose file for anchore-engine - to use:
 #
-# Pre-requisites
-# - recommend that anchore-cli is installed
-# 
-# Set up persistent volume for anchore-engine (do this once)
-# - create a directory ~aevolume
-# - create a directory ~aevolume/db
-# - create a directory ~aevolume/config
-# - copy the example (./scripts/docker-compose/config.yaml) to ~aevolume/config/config.yaml
-# - edit ~aevolume/config/config.yaml and save (only if you need to make changes - not required)
-# - review ./docker-compose.yaml
+#  IMPORTANT NOTE - for anchore-engine 0.4.0 and latest, we have moved
+#  to a new docker-compose method and approach for deploying
+#  anchore-engine with docker-compose, which more accurately reflects
+#  production deployment setups.
 #
-# Run, use, stop, restart the anchore-engine with docker-compose
-# - run: docker-compose up -d
+#  Please refer to the latest documentation for running anchore-engine
+#  with docker-compose:
 #
-# - interact with anchore-engine with anchore-cli:
-#   - export ANCHORE_CLI_URL=http://localhost:8228/v1
-#   - export ANCHORE_CLI_USER=admin
-#   - export ANCHORE_CLI_PASS=foobar
-#   - export ANCHORE_CLI_SSL_VERIFY=n
-#   - anchore-cli image list
-#   - anchore-cli image add alpine
-#   - anchore-cli image get alpine
-#   - ...
+#  https://docs.anchore.com/2.0/docs/engine/engine_installation/docker_compose/
 #
-# - stop: docker-compose down --volumes
+#  The following docker-compose.yaml has been altered to reference the
+#  latest 0.3 series release of anchore-engine for continuity, but
+#  note that both this and the associated config.yaml in this
+#  directory will be removed in the future.
 #
-# Notes:
-# - to start up again, run the same docker-compose up -d as above
-# - to reset the DB, stop anchore engine with docker-compose down --volumes as above, then remove all files/directories in ~aevolume/db/*, and restart
-# - if you enable SSL for any services, make sure to do so across the board in your config.yaml, and change the ANCHORE_CLI_URL to use https instead of http
-# - if you change the admin password in config.yaml, make sure to update your ANCHORE_CLI_PASS export as well
-# - if you change the DB password in this file, make sure to also change it in your config.yaml 'db_connect' setting
-# 
 
 version: '2'
 services:
   anchore-engine:
-    image: docker.io/anchore/anchore-engine:latest
+    image: docker.io/anchore/anchore-engine:v0.3.4
     #privileged: true
     depends_on:
      - anchore-db
@@ -45,19 +26,19 @@ services:
      - "8228:8228"
      - "8338:8338"
     volumes:
-     - ${PWD}/config:/config/:Z
-     #- /var/run/docker.sock:/var/run/docker.sock
+     - ./config:/config/:z
     logging:
      driver: "json-file"
      options:
       max-size: 100m
     environment:
      # NOTE: this should be set to the same name as this service (e.g. anchore-engine)
-     - ANCHORE_HOST_ID=anchore-engine
+     - ANCHORE_HOST_ID=dockerhostid-anchore-engine
+     - ANCHORE_ENDPOINT_HOSTNAME=anchore-engine
   anchore-db:
     image: "postgres:9"
     volumes:
-     - ${PWD}/db:/var/lib/postgresql/data/pgdata/:Z
+     - ./db:/var/lib/postgresql/data/pgdata/:z
     environment:
       - POSTGRES_PASSWORD=mysecretpassword
       - PGDATA=/var/lib/postgresql/data/pgdata/
@@ -74,7 +55,7 @@ services:
 #    depends_on:
 #     - anchore-engine
 #    volumes:
-#     - ${PWD}/anchore-prometheus.yml:/etc/prometheus/prometheus.yml:Z
+#     - ./anchore-prometheus.yaml:/etc/prometheus/prometheus.yml:z
 #    logging:
 #     driver: "json-file"
 #     options:

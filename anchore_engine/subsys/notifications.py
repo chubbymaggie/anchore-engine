@@ -1,17 +1,17 @@
 import json
-import os
 import uuid
-import tempfile
 
-from anchore_engine.clients import http
+from anchore_engine.clients.services import http
 import anchore_engine.configuration.localconfig
 from anchore_engine.subsys import logger
-from anchore_engine.clients import simplequeue
+from anchore_engine.clients.services.simplequeue import SimpleQueueClient
+from anchore_engine.clients.services import internal_client_for
 
 def queue_notification(userId, subscription_key, subscription_type, payload):
     
-    localconfig = anchore_engine.configuration.localconfig.get_config()
-    system_user_auth = localconfig['system_user_auth']
+    #localconfig = anchore_engine.configuration.localconfig.get_config()
+    #system_user_auth = localconfig['system_user_auth']
+    q_client = internal_client_for(SimpleQueueClient, None)
 
     rc = False
     try:
@@ -22,8 +22,8 @@ def queue_notification(userId, subscription_key, subscription_type, payload):
         }
         if payload:
             nobj.update(payload)
-        if not simplequeue.is_inqueue(system_user_auth, subscription_type, nobj):
-            rc = simplequeue.enqueue(system_user_auth, subscription_type, nobj)
+        if not q_client.is_inqueue(subscription_type, nobj):
+            rc = q_client.enqueue(subscription_type, nobj)
     except Exception as err:
         logger.warn("failed to create/enqueue notification")
         raise err
@@ -34,7 +34,7 @@ def make_notification(user_record, subscription_type, notification):
     ret = {}
     try:
         payload_data = {
-            'notification_user': user_record['userId'],
+            'notification_user': user_record['name'],
             'notification_user_email': user_record['email'],
             'notification_type': subscription_type,
             'notification_payload': notification
@@ -57,12 +57,12 @@ def notify(user_record, notification):
     return(True)
 
 def do_notify_webhook(user_record, notification):
-    logger.spew("webhook notify user: " + json.dumps(user_record, indent=4))
-    logger.debug("webhook notify user: " + json.dumps(notification, indent=4))
+    #logger.spew("webhook notify user: " + json.dumps(user_record, indent=4))
+    #logger.debug("webhook notify user: " + json.dumps(notification, indent=4))
 
     notification_type = notification['data']['notification_type']
     user = pw = None
-    subvars = [('<userId>', user_record['userId']), ('<notification_type>', notification_type)]
+    subvars = [('<userId>', user_record['name']), ('<notification_type>', notification_type)]
 
     try:
         payload = json.dumps(notification)

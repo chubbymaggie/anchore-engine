@@ -1,4 +1,3 @@
-# anchore modules
 import datetime
 import hashlib
 import json
@@ -6,15 +5,22 @@ import json
 from connexion import request
 
 # anchore modules
-from anchore_engine.clients import catalog, policy_engine
-from anchore_engine.clients.policy_engine.generated.rest import ApiException
-import anchore_engine.services.common
+import anchore_engine.apis
+import anchore_engine.common.helpers
+from anchore_engine.clients.services import internal_client_for
+from anchore_engine.clients.services.catalog import CatalogClient
+from anchore_engine.clients.services.policy_engine import PolicyEngineClient
+
+import anchore_engine.common
+import anchore_engine.configuration.localconfig
 from anchore_engine.subsys import logger
+from anchore_engine.apis.authorization import get_authorizer, RequestingAccountValue, ActionBoundPermission
+
+authorizer = get_authorizer()
 
 
-def make_response_policy(user_auth, policy_record, params):
+def make_response_policy(policy_record, params):
     ret = {}
-    userId, pw = user_auth
 
     try:
         policy_name = policy_description = None
@@ -61,97 +67,102 @@ def make_response_policy(user_auth, policy_record, params):
 
     return (ret)
 
+
+@authorizer.requires([ActionBoundPermission(domain=RequestingAccountValue())])
 def list_policies(detail=None):
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={'detail': False})
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={'detail': False})
     user_auth = request_inputs['auth']
     bodycontent = request_inputs['bodycontent']
     params = request_inputs['params']
 
     return_object = []
     httpcode = 500
-    userId, pw = user_auth
+    userId = request_inputs['userId']
 
     try:
         logger.debug('Listing policies')
-
+        client = internal_client_for(CatalogClient, request_inputs['userId'])
         try:
-            policy_records = catalog.list_policies(user_auth)
+            policy_records = client.list_policies()
+            httpcode = 200
         except Exception as err:
             logger.warn("unable to get policy_records for user (" + str(userId) + ") - exception: " + str(err))
             raise err
 
         if policy_records:
-            httpcode = 200
             ret = []
             for policy_record in policy_records:
-                ret.append(make_response_policy(user_auth, policy_record, params))
+                ret.append(make_response_policy(policy_record, params))
             return_object = ret
-        else:
-            httpcode = 404
-            raise Exception('no policies found for user')
+
     except Exception as err:
         logger.debug("operation exception: " + str(err))
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return (return_object, httpcode)
 
 
+@authorizer.requires([ActionBoundPermission(domain=RequestingAccountValue())])
 def add_policy(bundle):
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
-    user_auth = request_inputs['auth']
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={})
     bodycontent = request_inputs['bodycontent']
     params = request_inputs['params']
 
     return_object = []
     httpcode = 500
-    userId, pw = user_auth
+    userId = request_inputs['userId']
 
     try:
         logger.debug('Adding policy')
-
+        client = internal_client_for(CatalogClient, request_inputs['userId'])
         jsondata = json.loads(bodycontent)
 
         # schema check
         try:
-            p_client = policy_engine.get_client(user=user_auth[0], password=user_auth[1])
-            response = p_client.validate_bundle(policy_bundle=jsondata)
+            localconfig = anchore_engine.configuration.localconfig.get_config()
+            user_auth = localconfig['system_user_auth']
+            verify = localconfig.get('internal_ssl_verify', True)
 
-            if not response.valid:
+            p_client = internal_client_for(PolicyEngineClient, userId=userId)
+            response = p_client.validate_bundle(jsondata)
+
+            if not response.get('valid', False):
                 httpcode = 400
-                return_object = anchore_engine.services.common.make_response_error('Bundle failed validation', in_httpcode=400, detail={'validation_details': [x.to_dict() for x in response.validation_details]})
+                return_object = anchore_engine.common.helpers.make_response_error('Bundle failed validation', in_httpcode=400, details={'validation_details': response.get('validation_details')})
                 return (return_object, httpcode)
 
-        except ApiException as err:
+        except Exception as err:
             raise Exception('Error response from policy service during bundle validation. Validation could not be performed: {}'.format(err))
 
         if 'id' in jsondata and jsondata['id']:
             policyId = jsondata['id']
         else:
-            policyId = hashlib.md5(str(userId + ":" + jsondata['name'])).hexdigest()
+            policyId = hashlib.md5(str(userId + ":" + jsondata['name']).encode('utf8')).hexdigest()
             jsondata['id'] = policyId
 
         try:
             policybundle = jsondata
-            policy_record = catalog.add_policy(user_auth, policybundle)
+            policy_record = client.add_policy(policybundle)
         except Exception as err:
             raise Exception("cannot store policy data to catalog - exception: " + str(err))
 
         if policy_record:
-            return_object = make_response_policy(user_auth, policy_record, params)
+            return_object = make_response_policy(policy_record, params)
             httpcode = 200
         else:
             raise Exception('failed to add policy to catalog DB')
     except Exception as err:
         logger.debug("operation exception: " + str(err))
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return (return_object, httpcode)
 
 
+@authorizer.requires([ActionBoundPermission(domain=RequestingAccountValue())])
 def get_policy(policyId, detail=None):
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={'detail': True})
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={'detail': True})
     user_auth = request_inputs['auth']
     bodycontent = request_inputs['bodycontent']
     params = request_inputs['params']
@@ -161,9 +172,9 @@ def get_policy(policyId, detail=None):
     userId, pw = user_auth
     try:
         logger.debug('Get policy by bundle Id')
-
+        client = internal_client_for(CatalogClient, request_inputs['userId'])
         try:
-            policy_record = catalog.get_policy(user_auth, policyId=policyId)
+            policy_record = client.get_policy(policyId=policyId)
         except Exception as err:
             logger.warn("unable to get policy_records for user (" + str(userId) + ") - exception: " + str(err))
             raise err
@@ -171,32 +182,33 @@ def get_policy(policyId, detail=None):
 
         if policy_record:
             ret = []
-            ret.append(make_response_policy(user_auth, policy_record, params))
+            ret.append(make_response_policy(policy_record, params))
             return_object = ret
             httpcode = 200
         else:
             httpcode = 404
             raise Exception("cannot locate specified policyId")
     except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return (return_object, httpcode)
 
 
+@authorizer.requires([ActionBoundPermission(domain=RequestingAccountValue())])
 def update_policy(bundle, policyId, active=False):
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={'active': active})
-    user_auth = request_inputs['auth']
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={'active': active})
     method = request_inputs['method']
     bodycontent = request_inputs['bodycontent']
     params = request_inputs['params']
+    userId = request_inputs['userId']
 
     return_object = {}
     httpcode = 500
-    userId, pw = user_auth
 
     try:
         logger.debug("Updating policy")
+        client = internal_client_for(CatalogClient, request_inputs['userId'])
 
         if not bodycontent:
             bodycontent = '{}'
@@ -212,7 +224,7 @@ def update_policy(bundle, policyId, active=False):
             jsondata['active'] = False
 
         try:
-            policy_record = catalog.get_policy(user_auth, policyId=policyId)
+            policy_record = client.get_policy(policyId=policyId)
         except Exception as err:
             logger.warn("unable to get policy_records for user (" + str(userId) + ") - exception: " + str(err))
             raise err
@@ -230,35 +242,37 @@ def update_policy(bundle, policyId, active=False):
 
             # schema check
             try:
-                p_client = policy_engine.get_client(user=user_auth[0], password=user_auth[1])
-                response = p_client.validate_bundle(policy_bundle=jsondata['policybundle'])
-
-                if not response.valid:
+                localconfig = anchore_engine.configuration.localconfig.get_config()
+                user_auth = localconfig['system_user_auth']
+                verify = localconfig.get('internal_ssl_verify', True)
+                p_client = internal_client_for(PolicyEngineClient, userId)
+                response = p_client.validate_bundle(jsondata['policybundle'])
+                if not response.get('valid', False):
                     httpcode = 400
-                    return_object = anchore_engine.services.common.make_response_error('Bundle failed validation',
-                                                                                       in_httpcode=400, detail={
-                            'validation_details': [x.to_dict() for x in response.validation_details]})
+                    return_object = anchore_engine.common.helpers.make_response_error('Bundle failed validation',
+                                                                                      in_httpcode=400, details={'validation_details': response.get('validation_details')})
                     return (return_object, httpcode)
 
-            except ApiException as err:
+            except Exception as err:
                 raise Exception(
                     'Error response from policy service during bundle validation. Validation could not be performed: {}'.format(
                         err))
 
-            return_policy_record = catalog.update_policy(user_auth, policyId, policy_record=policy_record)
-            return_object = [make_response_policy(user_auth, return_policy_record, params)]
+            return_policy_record = client.update_policy(policyId, policy_record=policy_record)
+            return_object = [make_response_policy(return_policy_record, params)]
             httpcode = 200
         else:
             httpcode = 404
             raise Exception("cannot locate specified policyId")
     except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
     return (return_object, httpcode)
 
 
+@authorizer.requires([ActionBoundPermission(domain=RequestingAccountValue())])
 def delete_policy(policyId):
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={})
     user_auth = request_inputs['auth']
 
     return_object = {}
@@ -266,11 +280,11 @@ def delete_policy(policyId):
     userId, pw = user_auth
 
     try:
-        logger.debug("Delete policy")
-
+        logger.debug("Delete policy {}".format(policyId))
+        client = internal_client_for(CatalogClient, request_inputs['userId'])
         try:
             try:
-                policy_record = catalog.get_policy(user_auth, policyId=policyId)
+                policy_record = client.get_policy(policyId=policyId)
             except Exception as err:
                 logger.warn("unable to get policy_records for user (" + str(userId) + ") - exception: " + str(err))
                 raise err
@@ -283,7 +297,7 @@ def delete_policy(policyId):
                     raise Exception(
                         "cannot delete an active policy - activate a different policy then delete this one")
 
-            rc = catalog.delete_policy(user_auth, policyId=policyId)
+            rc = client.delete_policy(policyId=policyId)
         except Exception as err:
             raise err
 
@@ -294,7 +308,7 @@ def delete_policy(policyId):
             httpcode = 500
             raise Exception('not deleted')
     except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return (return_object, httpcode)

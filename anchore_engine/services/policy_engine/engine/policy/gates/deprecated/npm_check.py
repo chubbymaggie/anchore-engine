@@ -30,13 +30,13 @@ class NotLatestTrigger(BaseTrigger):
 
         feed_names = {p.name: p.latest for p in feed_npms}
 
-        for npm, versions in img_npms.items():
+        for npm, versions in list(img_npms.items()):
             if npm not in feed_names:
                 continue # Not an official
 
             for v in versions:
                 if v and v != feed_names.get(npm):
-                    self._fire("NPMNOTLATEST Package ("+npm+") version ("+v+") installed but is not the latest version ("+feed_names[npm]['latest']+")")
+                    self._fire(msg="NPMNOTLATEST Package ("+npm+") version ("+v+") installed but is not the latest version ("+feed_names[npm]['latest']+")")
 
 
 class NotOfficialTrigger(BaseTrigger):
@@ -63,7 +63,7 @@ class NotOfficialTrigger(BaseTrigger):
 
         feed_names = {p.name: p.versions_json for p in feed_npms}
 
-        for npm in img_npms.keys():
+        for npm in list(img_npms.keys()):
             if npm not in feed_names:
                 self._fire(msg="NPMNOTOFFICIAL Package ("+str(npm)+") in container but not in official NPM feed.")
 
@@ -91,7 +91,7 @@ class BadVersionTrigger(BaseTrigger):
 
         feed_names = {p.name: p.versions_json for p in feed_npms}
 
-        for npm, versions in img_npms.items():
+        for npm, versions in list(img_npms.items()):
             if npm not in feed_names:
                 continue
 
@@ -123,7 +123,7 @@ class PkgFullMatchTrigger(BaseTrigger):
             return
 
         match_versions = self.blacklist_names.value() if self.blacklist_names.value() else {}
-        for pkg, vers in match_versions.items():
+        for pkg, vers in list(match_versions.items()):
             try:
                 if pkg in pkgs and vers in pkgs.get(pkg, []):
                     self._fire(msg='NPMPKGFULLMATCH Package is blacklisted: '+pkg+"-"+vers)
@@ -158,6 +158,7 @@ class NoFeedTrigger(BaseTrigger):
     __lifecycle_state__ = LifecycleStates.deprecated
     __trigger_name__ = 'npmnofeed'
     __description__ = 'triggers if anchore does not have access to the NPM data feed'
+    __msg__ = "NPMNOFEED NPM packages are present but the anchore NPM feed is not available - will be unable to perform checks that require feed data"
 
     def evaluate(self, image_obj, context):
         try:
@@ -199,9 +200,9 @@ class NpmCheckGate(Gate):
 
         context.data[NPM_LISTING_KEY] = {p.name: p.versions_json for p in image_obj.npms}
 
-        npms = context.data[NPM_LISTING_KEY].keys()
+        npms = list(context.data[NPM_LISTING_KEY].keys())
         context.data[NPM_MATCH_KEY] = []
-        chunks = [npms[i: i+100] for i in xrange(0, len(npms), 100)]
+        chunks = [npms[i: i+100] for i in range(0, len(npms), 100)]
         for key_range in chunks:
             context.data[NPM_MATCH_KEY] += context.db.query(NpmMetadata).filter(NpmMetadata.name.in_(key_range)).all()
 

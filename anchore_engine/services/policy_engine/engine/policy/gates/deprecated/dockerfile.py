@@ -115,13 +115,13 @@ class DirectiveCheckTrigger(BaseTrigger):
 
         df = context.data.get('prepared_dockerfile')
 
-        for directive_name, lines in filter(lambda x: x[0] == directive, df.items()):
+        for directive_name, lines in [x for x in list(df.items()) if x[0] == directive]:
             for l in lines:
                 l = l[len(directive_name):].strip()
                 if operation(l, check_value):
                     self._fire(msg="Dockerfile directive '{}' check '{}' matched against '{}' for line '{}'".format(directive_name, condition, check_value if check_value else '', l))
 
-        upper_keys = set(map(lambda x: x.upper(), df.keys()))
+        upper_keys = set([x.upper() for x in list(df.keys())])
         if condition == 'not_exists' and directive not in upper_keys:
             self._fire(msg="Dockerfile directive '{}' not found, matching condition '{}' check".format(directive, condition))
 
@@ -360,7 +360,12 @@ class DockerfileGate(Gate):
                     else:
                         linebuf = linebuf + line
                         if linebuf:
-                            directive,remainder = linebuf.split(' ', 1)
+                            tokens = linebuf.split(' ', 1)
+                            if tokens:
+                                directive = tokens[0]
+                            else:
+                                directive = ''
+
                             directive = directive.upper()
                             if directive not in context.data['prepared_dockerfile']:
                                 context.data['prepared_dockerfile'][directive] = []

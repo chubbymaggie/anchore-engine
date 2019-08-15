@@ -12,16 +12,27 @@ import datetime
 import re
 import threading
 import time
+import traceback
 
 from anchore_engine.db import get_thread_scoped_session as get_session
 from anchore_engine.db import GenericFeedDataRecord, FeedMetadata, FeedGroupMetadata
-from anchore_engine.db import FixedArtifact, Vulnerability, VulnerableArtifact, GemMetadata, NpmMetadata, NvdMetadata, CpeVulnerability
+from anchore_engine.db import FixedArtifact, Vulnerability, GemMetadata, NpmMetadata, NvdMetadata, CpeVulnerability, NvdV2Metadata, CpeV2Vulnerability, VulnDBMetadata, VulnDBCpe
 from anchore_engine.services.policy_engine.engine.logs import get_logger
-from anchore_engine.clients.feeds.feed_service.feeds import get_client as get_feeds_client, InsufficientAccessTierError, InvalidCredentialsError
+from anchore_engine.clients.feeds.feed_service import get_client as get_feeds_client, InsufficientAccessTierError, InvalidCredentialsError
+from anchore_engine.util.langpack import convert_langversionlist_to_semver
+from anchore_engine.utils import CPE
 
 log = get_logger()
 
 feed_list_cache = threading.local()
+
+
+def build_group_sync_result():
+    return {'group': None, 'status': None, 'total_time_seconds': 0, 'updated_record_count': 0, 'updated_image_count': 0}
+
+
+def build_feed_sync_results():
+    return {'feed': None, 'status': None, 'total_time_seconds': 0, 'groups': []}
 
 
 def get_feeds_config(full_config):
@@ -46,7 +57,7 @@ def get_selected_feeds_to_sync(config):
         return []
 
     if feed_config.get('selective_sync', {}).get('enabled', False):
-        return map(lambda x: x[0], filter(lambda x: x[1], feed_config.get('selective_sync', {}).get('feeds', {}).items()))
+        return [x[0] for x in [x for x in list(feed_config.get('selective_sync', {}).get('feeds', {}).items()) if x[1]]]
     else:
         return None
 
@@ -100,8 +111,8 @@ class KeyIDFeedDataMapper(FeedDataMapper):
     """
 
     def map(self, record_json):
-        if len(record_json.keys()) == 1:
-            key, value = record_json.items()[0]
+        if len(list(record_json.keys())) == 1:
+            key, value = list(record_json.items())[0]
             return self.map_inner(key, value)
 
     def map_inner(self, key, data):
@@ -252,6 +263,173 @@ class NvdFeedDataMapper(FeedDataMapper):
 
         return db_rec
 
+class NvdV2FeedDataMapper(FeedDataMapper):
+    """
+    Maps an NVD record into an NvdMetadata ORM object
+    """
+    def map(self, record_json):
+        db_rec = NvdV2Metadata()
+
+        #log.debug("V2 DBREC: {}".format(json.dumps(record_json)))
+        db_rec = NvdV2Metadata()
+        db_rec.name = record_json.get('cve', {}).get('CVE_data_meta', {}).get('ID', None)
+        db_rec.namespace_name = self.group
+        db_rec.description = record_json.get('cve', {}).get('description', {}).get('description_data', [{}])[0].get('value', "")
+        db_rec.cvss_v2 = record_json.get('cvss_v2', None)
+        db_rec.cvss_v3 = record_json.get('cvss_v3', None)
+        db_rec.severity = record_json.get('severity') if record_json.get('severity', None) else 'Unknown'
+        db_rec.link = "https://nvd.nist.gov/vuln/detail/{}".format(db_rec.name)
+        db_rec.references = record_json.get('external_references', [])
+
+        db_rec.vulnerable_cpes = []
+        for input_cpe in record_json.get('vulnerable_cpes', []):
+            try:
+                # "cpe:2.3:a:openssl:openssl:-:*:*:*:*:*:*:*",
+                # TODO - handle cpe inputs with escaped characters
+                # cpetoks = input_cpe.split(":")
+                cpe_obj = CPE.from_cpe23_fs(input_cpe)
+                newcpe = CpeV2Vulnerability()
+                newcpe.feed_name = self.feed
+                newcpe.part = cpe_obj.part
+                newcpe.vendor = cpe_obj.vendor
+                newcpe.product = cpe_obj.product
+                newcpe.version = cpe_obj.version
+                newcpe.update = cpe_obj.update
+                newcpe.edition = cpe_obj.edition
+                newcpe.language = cpe_obj.language
+                newcpe.sw_edition = cpe_obj.sw_edition
+                newcpe.target_sw = cpe_obj.target_sw
+                newcpe.target_hw = cpe_obj.target_hw
+                newcpe.other = cpe_obj.other
+                db_rec.vulnerable_cpes.append(newcpe)
+            except Exception as err:
+                log.warn("failed to convert vulnerable-software-list into database CPEV2 record - exception: " + str(err))
+
+        return db_rec
+
+
+class VulnDBFeedDataMapper(FeedDataMapper):
+    """
+    Maps an VulnDB record into an ORM object
+    """
+
+    def map(self, record_json):
+        #log.debug("V2 DBREC: {}".format(json.dumps(record_json)))
+        db_rec = VulnDBMetadata()
+        db_rec.name = record_json.get('id')
+        db_rec.namespace_name = self.group
+        db_rec.title = record_json.get('title', None)
+        db_rec.description = record_json.get('description', None)
+        db_rec.solution = record_json.get('solution', None)
+        db_rec.vendor_product_info = record_json.get('vendor_product_info', [])
+        db_rec.references = record_json.get('external_references', [])
+        db_rec.vulnerable_packages = record_json.get('vulnerable_packages', [])
+        db_rec.vulnerable_libraries = record_json.get('vulnerable_libraries', [])
+        db_rec.vendor_cvss_v2 = record_json.get('vendor_cvss_v2', [])
+        db_rec.vendor_cvss_v3 = record_json.get('vendor_cvss_v3', [])
+        db_rec.nvd = record_json.get('nvd', [])
+        db_rec.vuln_metadata = record_json.get('metadata', {})
+        db_rec.severity = record_json.get('severity') if record_json.get('severity', None) else 'Unknown'
+
+        db_rec.cpes = []
+        for input_cpe in record_json.get('vulnerable_cpes', []):
+            try:
+                # "cpe:2.3:a:openssl:openssl:-:*:*:*:*:*:*:*",
+                cpe_obj = CPE.from_cpe23_fs(input_cpe)
+                newcpe = VulnDBCpe()
+                newcpe.feed_name = self.feed
+                # newcpe.severity = db_rec.severity  # todo ugh! get this from the parent!
+                newcpe.part = cpe_obj.part
+                newcpe.vendor = cpe_obj.vendor.replace('\\', '')
+                newcpe.product = cpe_obj.product.replace('\\', '')
+                newcpe.version = cpe_obj.version.replace('\\', '')
+                newcpe.update = cpe_obj.update.replace('\\', '')
+                newcpe.edition = cpe_obj.edition.replace('\\', '')
+                newcpe.language = cpe_obj.language.replace('\\', '')
+                newcpe.sw_edition = cpe_obj.sw_edition.replace('\\', '')
+                newcpe.target_sw = cpe_obj.target_sw.replace('\\', '')
+                newcpe.target_hw = cpe_obj.target_hw.replace('\\', '')
+                newcpe.other = cpe_obj.other.replace('\\', '')
+                newcpe.is_affected = True
+
+                db_rec.cpes.append(newcpe)
+            except Exception as err:
+                log.warn('failed to convert vendor_product_info into database VulnDBCpe record - exception: ' + str(err))
+
+        for input_cpe in record_json.get('unaffected_cpes', []):
+            try:
+                # "cpe:2.3:a:openssl:openssl:-:*:*:*:*:*:*:*",
+                cpe_obj = CPE.from_cpe23_fs(input_cpe)
+                newcpe = VulnDBCpe()
+                newcpe.feed_name = self.feed
+                # newcpe.severity = db_rec.severity  # todo ugh! get this from the parent!
+                newcpe.part = cpe_obj.part
+                newcpe.vendor = cpe_obj.vendor.replace('\\', '')
+                newcpe.product = cpe_obj.product.replace('\\', '')
+                newcpe.version = cpe_obj.version.replace('\\', '')
+                newcpe.update = cpe_obj.update.replace('\\', '')
+                newcpe.edition = cpe_obj.edition.replace('\\', '')
+                newcpe.language = cpe_obj.language.replace('\\', '')
+                newcpe.sw_edition = cpe_obj.sw_edition.replace('\\', '')
+                newcpe.target_sw = cpe_obj.target_sw.replace('\\', '')
+                newcpe.target_hw = cpe_obj.target_hw.replace('\\', '')
+                newcpe.other = cpe_obj.other.replace('\\', '')
+                newcpe.is_affected = False
+
+                db_rec.cpes.append(newcpe)
+            except Exception as err:
+                log.warn('failed to convert vendor_product_info into database VulnDBCpe record - exception: ' + str(err))
+
+        return db_rec
+
+
+class SnykFeedDataMapper(FeedDataMapper):
+    """
+    Maps a Snyk record into an Vulnerability ORM object
+    """
+    def map(self, record_json):
+        if not record_json:
+            return None
+
+        # get the fundamental categories/ids
+        id = list(record_json.keys()).pop()
+        pkgvuln = record_json[id]
+        (group_name, nslang) = self.group.split(":", 2)
+
+        # create a new vulnerability record
+        db_rec = Vulnerability()
+
+        # primary keys
+        db_rec.namespace_name = self.group
+        db_rec.id = id
+
+        # severity calculation
+        db_rec.cvss2_score = pkgvuln.get('cvssScore')
+        db_rec.cvss2_vectors = pkgvuln.get('cvssV3')
+        db_rec.severity = db_rec.get_cvss_severity()
+
+        # other metadata
+        db_rec.link = pkgvuln.get('url')
+        db_rec.description = ""
+        db_rec.additional_metadata = pkgvuln
+
+        # add fixed_in records
+        semver_range = convert_langversionlist_to_semver(pkgvuln.get('vulnerableVersions', []), nslang)
+        sem_versions = semver_range.split(' || ')
+        for sem_version in sem_versions:
+            v_in = FixedArtifact()
+            v_in.name = pkgvuln.get("package")
+            v_in.version = sem_version
+            v_in.version_format = "semver" #"semver:{}".format(nslang)
+            v_in.epochless_version = v_in.version
+            v_in.vulnerability_id = db_rec.id
+            v_in.namespace_name = db_rec.namespace_name
+            v_in.fix_metadata = {'fix_exists': pkgvuln.get('upgradeable', False)}
+            db_rec.fixed_in.append(v_in)
+
+        return db_rec
+
+
 class VulnerabilityFeedDataMapper(FeedDataMapper):
     """  
     Maps a Vulnerability record:
@@ -304,7 +482,7 @@ class VulnerabilityFeedDataMapper(FeedDataMapper):
             return None
 
         # Handle a 'Vulnerability' wrapper around the specific record. If not present, assume a direct record
-        if len(record_json.keys()) == 1 and record_json.get('Vulnerability'):
+        if len(list(record_json.keys())) == 1 and record_json.get('Vulnerability'):
             vuln = record_json['Vulnerability']
         else:
             vuln = record_json
@@ -320,9 +498,10 @@ class VulnerabilityFeedDataMapper(FeedDataMapper):
         else:
             db_rec.description = ""
         db_rec.fixed_in = []
-        db_rec.vulnerable_in = []
+        #db_rec.vulnerable_in = []
 
-        db_rec.metadata_json = json.dumps(vuln.get('Metadata')) if 'Metadata' in vuln else None
+        #db_rec.metadata_json = json.dumps(vuln.get('Metadata')) if 'Metadata' in vuln else None
+        db_rec.additional_metadata = vuln.get('Metadata', {})
         cvss_data = vuln.get('Metadata', {}).get('NVD', {}).get('CVSSv2')
         if cvss_data:
             db_rec.cvss2_vectors = cvss_data.get('Vectors')
@@ -343,17 +522,17 @@ class VulnerabilityFeedDataMapper(FeedDataMapper):
 
                 db_rec.fixed_in.append(fix)
 
-        if 'VulnerableIn' in vuln:
-            for v in vuln['VulnerableIn']:
-                v_in = VulnerableArtifact()
-                v_in.name = v['Name']
-                v_in.version = v['Version']
-                v_in.version_format = v['VersionFormat']
-                v_in.epochless_version = re.sub(r'^[0-9]*:', '', v['Version'])
-                v_in.vulnerability_id = db_rec.id
-                v_in.namespace_name = self.group
-
-                db_rec.vulnerable_in.append(v_in)
+#        if 'VulnerableIn' in vuln:
+#            for v in vuln['VulnerableIn']:
+#                v_in = VulnerableArtifact()
+#                v_in.name = v['Name']
+#                v_in.version = v['Version']
+#                v_in.version_format = v['VersionFormat']
+#                v_in.epochless_version = re.sub(r'^[0-9]*:', '', v['Version'])
+#                v_in.vulnerability_id = db_rec.id
+#                v_in.namespace_name = self.group
+#
+#                db_rec.vulnerable_in.append(v_in)
 
         return db_rec
 
@@ -569,9 +748,9 @@ class AnchoreServiceFeed(DataFeed):
             if meta_record:
                 self.metadata = meta_record
 
-        my_feed = filter(lambda x: x.name == self.__feed_name__, self.source.list_feeds())
+        my_feed = [x for x in self.source.list_feeds() if x.name == self.__feed_name__]
         if not my_feed:
-            raise StandardError('No feed with name {} found on feed source'.format(self.__feed_name__))
+            raise Exception('No feed with name {} found on feed source'.format(self.__feed_name__))
         else:
             my_feed = my_feed[0]
 
@@ -617,7 +796,7 @@ class AnchoreServiceFeed(DataFeed):
             mapper = self.__class__.__group_data_mappers__.get(group_obj.name)
 
         if not mapper:
-            raise StandardError('No mapper class found for group: {}'.format(group_obj.name))
+            raise Exception('No mapper class found for group: {}'.format(group_obj.name))
 
             # If it's a class, instantiate it
         if type(mapper) == type:
@@ -696,12 +875,13 @@ class AnchoreServiceFeed(DataFeed):
             pages += 1
             for x in new_data:
                 mapped = mapper.map(x)
-                new_data_deduped[self._dedup_data_key(mapped)] = mapped
+                if mapped:
+                    new_data_deduped[self._dedup_data_key(mapped)] = mapped
 
             new_data = None
             log.debug('Page = {}, new_data = {}, next_token = {}'.format(pages, bool(new_data), bool(next_token), max_pages))
 
-        data = new_data_deduped.values()
+        data = list(new_data_deduped.values())
         new_data_deduped = None
         return data, next_token
 
@@ -746,7 +926,10 @@ class AnchoreServiceFeed(DataFeed):
         :return:
         """
         sync_time = time.time()
-        updated_images = set()
+        total_updated_count = 0
+        result = build_group_sync_result()
+        result['group'] = group_obj.name
+
         db = get_session()
         if full_flush:
             last_sync = None
@@ -765,11 +948,13 @@ class AnchoreServiceFeed(DataFeed):
                 log.info('Group data fetch took {} sec'.format(fetch_time))
                 log.info('Merging {} records from group {}'.format(len(new_data_deduped), group_obj.name))
                 db_time = time.time()
+
                 for rec in new_data_deduped:
                     merged = db.merge(rec)
                     #db.add(merged)
                 db.flush()
                 log.info('Db merge took {} sec'.format(time.time() - db_time))
+                total_updated_count += len(new_data_deduped)
 
             group_obj.last_sync = datetime.datetime.utcnow()
             db.add(group_obj)
@@ -782,7 +967,11 @@ class AnchoreServiceFeed(DataFeed):
             sync_time = time.time() - sync_time
             log.info('Syncing group took {} sec'.format(sync_time))
 
-        return updated_images
+        result['updated_record_count'] = total_updated_count
+        result['status'] = 'success'
+        result['total_time_seconds'] = sync_time
+        result['updated_image_count'] = 0
+        return result
 
     def _flush_group(self, group_obj, flush_helper_fn=None):
         """
@@ -811,19 +1000,7 @@ class AnchoreServiceFeed(DataFeed):
         :return: map of group:record_count for insertions
         """
 
-        db = get_session()
-        try:
-            log.debug('Refreshing groups for bulk sync')
-            self._sync_meta()
-            self.refresh_groups()
-            db.add(self.metadata)
-            db.commit()
-        except (InvalidCredentialsError, InsufficientAccessTierError):
-            raise
-        except Exception as e:
-            log.exception('Error updating feed metadata')
-            db.rollback()
-            raise
+        self.init_feed_meta_and_groups()
 
         updated_records = {}
 
@@ -866,6 +1043,20 @@ class AnchoreServiceFeed(DataFeed):
                 db_session.rollback()
             raise
 
+    def init_feed_meta_and_groups(self):
+        db = get_session()
+        try:
+            log.debug('Refreshing groups')
+            self._sync_meta()
+            self.refresh_groups()
+            db.add(self.metadata)
+            db.commit()
+        except (InsufficientAccessTierError, InvalidCredentialsError):
+            raise
+        except Exception as e:
+            db.rollback()
+            raise
+
     def sync(self, group=None, item_processing_fn=None, full_flush=False, flush_helper_fn=None):
         """
         Sync data with the feed source. This may be *very* slow if there are lots of updates.
@@ -881,22 +1072,16 @@ class AnchoreServiceFeed(DataFeed):
         :return: changed data updated in the sync as a list of records        
         """
 
-        db = get_session()
-        try:
-            log.debug('Refreshing groups')
-            self._sync_meta()
-            self.refresh_groups()
-            db.add(self.metadata)
-            db.commit()
-        except (InsufficientAccessTierError, InvalidCredentialsError):
-            raise
-        except Exception as e:
-            log.exception('Error updating feed metadata')
-            db.rollback()
-            raise
+        self.init_feed_meta_and_groups()
 
-        updated_records = {}
+        result = build_feed_sync_results()
+        result['status'] = 'failure'
+        result['feed'] = self.__feed_name__
+
+        failed_count = 0
+
         # Each group update is a unique session and can roll itself back.
+        t = time.time()
         for g in self.metadata.groups:
             log.info('Processing group: {}'.format(g.name))
             if not group or g.name == group:
@@ -906,12 +1091,14 @@ class AnchoreServiceFeed(DataFeed):
 
                 try:
                     new_data = self._sync_group(g, full_flush=full_flush)  # Each group sync is a transaction
-                    updated_records[g.name] = new_data
+                    result['groups'].append(new_data)
                 except Exception as e:
                     log.exception('Failed syncing group data for {}/{}'.format(self.__feed_name__, g.name))
+                    failed_count += 1
             else:
                 log.info('Skipping group {} since not selected'.format(g))
 
+        sync_time = time.time() - t
         db = get_session()
         try:
             # Update timestamps
@@ -924,10 +1111,12 @@ class AnchoreServiceFeed(DataFeed):
             db.rollback()
             raise
 
-        return updated_records
+        result['total_time_seconds'] = sync_time
+        result['status'] = 'success' if failed_count == 0 else 'failure'
+        return result
 
     def group_by_name(self, group_name):
-        return filter(lambda x: x.name == group_name, self.metadata.groups) if self.metadata else []
+        return [x for x in self.metadata.groups if x.name == group_name] if self.metadata else []
 
     def refresh_groups(self):
         group_list = self.source.list_feed_groups(self.__feed_name__)
@@ -983,7 +1172,10 @@ class VulnerabilityFeed(AnchoreServiceFeed):
         :return:
         """
         sync_time = time.time()
-        updated_images = set() # A set
+        result = build_group_sync_result()
+        result['status'] = 'failure'
+        result['group'] = group_obj.name
+
         db = get_session()
 
         if full_flush:
@@ -991,6 +1183,8 @@ class VulnerabilityFeed(AnchoreServiceFeed):
         else:
             last_sync = group_obj.last_sync
 
+        total_updated_count = 0
+        updated_images = set()
         try:
             next_token = ''
             while next_token is not None:
@@ -1001,6 +1195,8 @@ class VulnerabilityFeed(AnchoreServiceFeed):
                 fetch_time = time.time() - fetch_time
                 log.debug('Group data fetch took {} sec'.format(fetch_time))
                 log.debug('Merging {} records from group {}'.format(len(new_data_deduped), group_obj.name))
+                total_updated_count += len(new_data_deduped)
+
                 db_time = time.time()
                 for rec in new_data_deduped:
                     # Make any updates and changes within this single transaction scope
@@ -1020,7 +1216,11 @@ class VulnerabilityFeed(AnchoreServiceFeed):
             sync_time = time.time() - sync_time
             log.info('Syncing group took {} sec'.format(sync_time))
 
-        return updated_images
+        result['total_time_seconds'] = sync_time
+        result['status'] = 'success'
+        result['updated_image_count'] = len(list(updated_images))
+        result['updated_record_count'] = total_updated_count
+        return result
 
     @staticmethod
     def _are_match_equivalent(vulnerability_a, vulnerability_b):
@@ -1047,14 +1247,14 @@ class VulnerabilityFeed(AnchoreServiceFeed):
             log.debug('Fixed In records diff: {}'.format(fix_diff))
             return False
 
-        normalized_vulnin_a = {(vuln.name, vuln.epochless_version, vuln.version) for vuln in vulnerability_a.vulnerable_in}
-        normalized_vulnin_b = {(vuln.name, vuln.epochless_version, vuln.version) for vuln in vulnerability_b.vulnerable_in}
+        #normalized_vulnin_a = {(vuln.name, vuln.epochless_version, vuln.version) for vuln in vulnerability_a.vulnerable_in}
+        #normalized_vulnin_b = {(vuln.name, vuln.epochless_version, vuln.version) for vuln in vulnerability_b.vulnerable_in}
 
-        vulnin_diff = normalized_vulnin_a.symmetric_difference(normalized_vulnin_b)
+        #vulnin_diff = normalized_vulnin_a.symmetric_difference(normalized_vulnin_b)
 
-        if vulnin_diff:
-            log.debug('VulnIn records diff: {}'.format(vulnin_diff))
-            return False
+        #if vulnin_diff:
+        #    log.debug('VulnIn records diff: {}'.format(vulnin_diff))
+        #    return False
 
         return True
 
@@ -1103,8 +1303,8 @@ class VulnerabilityFeed(AnchoreServiceFeed):
 
         count = db.query(FixedArtifact).filter(FixedArtifact.namespace_name == group_obj.name).delete()
         log.info('Flushed {} fix records'.format(count))
-        count = db.query(VulnerableArtifact).filter(VulnerableArtifact.namespace_name == group_obj.name).delete()
-        log.info('Flushed {} vuln_in records'.format(count))
+        #count = db.query(VulnerableArtifact).filter(VulnerableArtifact.namespace_name == group_obj.name).delete()
+        #log.info('Flushed {} vuln_in records'.format(count))
         count = db.query(Vulnerability).filter(Vulnerability.namespace_name == group_obj.name).delete()
         log.info('Flushed {} vulnerability records'.format(count))
 
@@ -1125,21 +1325,16 @@ class VulnerabilityFeed(AnchoreServiceFeed):
         :return: changed data updated in the sync as a list of records
         """
 
-        db = get_session()
-        try:
-            log.debug('Refreshing groups')
-            self._sync_meta()
-            self.refresh_groups()
-            db.add(self.metadata)
-            db.commit()
-        except (InvalidCredentialsError, InsufficientAccessTierError):
-            raise
-        except Exception as e:
-            log.exception('Error updating feed metadata')
-            db.rollback()
-            raise
+        self.init_feed_meta_and_groups()
 
-        updated_records = {}
+        result = {
+            'feed': self.__feed_name__,
+            'status': 'sync_failed',
+            'total_time_seconds': -1,
+            'groups': []
+        }
+
+        groups_failed = 0
 
         # Setup the group name cache
         feed_list_cache.vuln_group_list = [x.name for x in self.metadata.groups]
@@ -1154,14 +1349,21 @@ class VulnerabilityFeed(AnchoreServiceFeed):
 
                     try:
                         new_data = self._sync_group(g, vulnerability_processing_fn=item_processing_fn, full_flush=full_flush)
-                        updated_records[g.name] = new_data
+                        #updated_records[g.name] = new_data
+                        result['groups'].append(new_data)
                     except Exception as e:
                         log.exception('Failed syncing group data for {}/{}'.format(self.__feed_name__, g.name))
+                        groups_failed += 1
                 else:
                     log.info('Group not selected for sync: {}. Skipping.'.format(g.name))
 
             self._update_last_sync_timestamp()
-            return updated_records
+            if groups_failed > 0:
+                result['status'] = 'failure'
+            else:
+                result['status'] = 'success'
+            return result
+
         finally:
             feed_list_cache.vuln_group_list = None
 
@@ -1231,6 +1433,24 @@ class PackagesFeed(AnchoreServiceFeed):
         finally:
             db.rollback()
 
+    def _flush_group(self, group_obj, flush_helper_fn=None):
+        db = get_session()
+        if flush_helper_fn:
+            flush_helper_fn(db=db, feed_name=group_obj.feed_name, group_name=group_obj.name)
+
+        if group_obj.name == 'npm':
+            ent_cls = NpmMetadata
+        elif group_obj.name == 'gem':
+            ent_cls = GemMetadata
+        else:
+            log.info('Unknown group name {}. Nothing to flush'.format(group_obj.name))
+            return
+
+        count = db.query(ent_cls).delete()
+        log.info('Flushed {} {} records'.format(count, group_obj.name))
+
+        db.flush()
+
 
 class NvdFeed(AnchoreServiceFeed):
     """
@@ -1251,6 +1471,19 @@ class NvdFeed(AnchoreServiceFeed):
         except Exception as e:
             log.exception('Could not retrieve nvd vulnerability by key:')
 
+    def _flush_group(self, group_obj, flush_helper_fn=None):
+
+        db = get_session()
+        if flush_helper_fn:
+            flush_helper_fn(db=db, feed_name=group_obj.feed_name, group_name=group_obj.name)
+
+        count = db.query(CpeVulnerability).filter(CpeVulnerability.namespace_name == group_obj.name).delete()
+        log.info('Flushed {} CpeVuln records'.format(count))
+        count = db.query(NvdMetadata).filter(NvdMetadata.namespace_name == group_obj.name).delete()
+        log.info('Flushed {} Nvd records'.format(count))
+
+        db.flush()
+
     def _dedup_data_key(self, item):
         return item.name
 
@@ -1267,6 +1500,133 @@ class NvdFeed(AnchoreServiceFeed):
         finally:
             db.rollback()
 
+class NvdV2Feed(AnchoreServiceFeed):
+    """
+    Feed for package data, served from the anchore feed service backend
+    """
+
+    __feed_name__ = 'nvdv2'
+    _cve_key = '@id'
+    __group_data_mappers__ = SingleTypeMapperFactory(__feed_name__, NvdV2FeedDataMapper, _cve_key)
+
+    def query_by_key(self, key, group=None):
+        if not group:
+            raise ValueError('Group must be specified since it is part of the key for vulnerabilities')
+
+        db = get_session()
+        try:
+            return db.query(NvdV2Metadata).get((key, group))
+        except Exception as e:
+            log.exception('Could not retrieve nvd vulnerability by key:')
+
+    def _flush_group(self, group_obj, flush_helper_fn=None):
+
+        db = get_session()
+        if flush_helper_fn:
+            flush_helper_fn(db=db, feed_name=group_obj.feed_name, group_name=group_obj.name)
+
+        count = db.query(CpeV2Vulnerability).filter(CpeV2Vulnerability.namespace_name == group_obj.name).delete()
+        log.info('Flushed {} CpeV2Vuln records'.format(count))
+        count = db.query(NvdV2Metadata).filter(NvdV2Metadata.namespace_name == group_obj.name).delete()
+        log.info('Flushed {} NvdV2 records'.format(count))
+
+        db.flush()
+
+    def _dedup_data_key(self, item):
+        return item.name
+
+    def record_count(self, group_name):
+        db = get_session()
+        try:
+            return db.query(NvdV2Metadata).filter(NvdV2Metadata.namespace_name == group_name).count()
+        except Exception as e:
+            log.exception('Error getting feed data group record count in package feed for group: {}'.format(group_name))
+            raise
+        finally:
+            db.rollback()
+
+
+class VulnDBFeed(AnchoreServiceFeed):
+    """
+    Feed for VulnDB data served from on-prem enterprise feed service
+    """
+
+    __feed_name__ = 'vulndb'
+    _cve_key = 'id'
+    __group_data_mappers__ = SingleTypeMapperFactory(__feed_name__, VulnDBFeedDataMapper, _cve_key)
+
+    def query_by_key(self, key, group=None):
+        if not group:
+            raise ValueError('Group must be specified since it is part of the key for vulnerabilities')
+
+        db = get_session()
+        try:
+            return db.query(VulnDBMetadata).get((key, group))
+        except Exception as e:
+            log.exception('Could not retrieve nvd vulnerability by key:')
+
+    def _flush_group(self, group_obj, flush_helper_fn=None):
+
+        db = get_session()
+        if flush_helper_fn:
+            flush_helper_fn(db=db, feed_name=group_obj.feed_name, group_name=group_obj.name)
+
+        count = db.query(VulnDBCpe).filter(VulnDBCpe.namespace_name == group_obj.name).delete()
+        log.info('Flushed {} VulnDBCpe records'.format(count))
+        count = db.query(VulnDBMetadata).filter(VulnDBMetadata.namespace_name == group_obj.name).delete()
+        log.info('Flushed {} VulnDBMetadata records'.format(count))
+
+        db.flush()
+
+    def _dedup_data_key(self, item):
+        return item.name
+
+    def record_count(self, group_name):
+        db = get_session()
+        try:
+            return db.query(VulnDBMetadata).filter(VulnDBMetadata.namespace_name == group_name).count()
+        except Exception as e:
+            log.exception('Error getting feed data group record count in vulndb feed for group: {}'.format(group_name))
+            raise
+        finally:
+            db.rollback()
+
+
+class SnykFeed(VulnerabilityFeed):
+    """
+    Feed for package data, served from the anchore feed service backend
+    """
+
+    __feed_name__ = 'snyk'
+    _cve_key = 'id'
+    __group_data_mappers__ = SingleTypeMapperFactory(__feed_name__, SnykFeedDataMapper, _cve_key)
+
+#    def query_by_key(self, key, group=None):
+#        if not group:
+#            raise ValueError('Group must be specified since it is part of the key for vulnerabilities')
+#        db = get_session()
+#        try:
+#            return db.query(Vulnerability).get((key, group))
+#        except Exception as e:
+#            log.exception('Could not retrieve snyk vulnerability by key:')
+
+#    def _dedup_data_key(self, item):
+#        return item.id
+
+    def record_count(self, group_name):
+        db = get_session()
+        try:
+            if 'snyk' in group_name:
+                return db.query(Vulnerability).filter(Vulnerability.namespace_name == group_name).count()
+            else:
+                return 0
+        except Exception as e:
+            log.exception('Error getting feed data group record count in package feed for group: {}'.format(group_name))
+            raise
+        finally:
+            db.rollback()
+
+
 class FeedFactory(object):
     """
     Factory class for creating feed objects. Not necessary yet because we don't have any dynamically updated feeds such that we
@@ -1276,7 +1636,10 @@ class FeedFactory(object):
     override_mapping = {
         'vulnerabilities': VulnerabilityFeed,
         'packages': PackagesFeed,
-        'nvd': NvdFeed
+        'nvd': NvdFeed,
+        'nvdv2': NvdV2Feed,
+        'snyk': SnykFeed,
+        'vulndb': VulnDBFeed,
     }
 
     default_mapping = AnchoreServiceFeed
@@ -1317,6 +1680,9 @@ class DataFeeds(object):
     _vulnerabilitiesFeed_cls = VulnerabilityFeed
     _packagesFeed_cls = PackagesFeed
     _nvdsFeed_cls = NvdFeed
+    _nvdV2sFeed_cls = NvdV2Feed
+    _snyksFeed_cls = SnykFeed
+    _vulndbFeed_cls = VulnDBFeed
 
     def __init__(self):
         self.vuln_fn = None
@@ -1357,6 +1723,12 @@ class DataFeeds(object):
             return self.packages.record_count(group_name)
         elif feed_name == 'nvd':
             return self.nvd.record_count(group_name)
+        elif feed_name == 'nvdv2':
+            return self.nvdV2.record_count(group_name)
+        elif feed_name == 'snyk':
+            return self.snyk.record_count(group_name)
+        elif feed_name == 'vulndb':
+            return self.vulndb.record_count(group_name)
         else:
             return 0
 
@@ -1384,6 +1756,21 @@ class DataFeeds(object):
         except (InsufficientAccessTierError, InvalidCredentialsError) as e:
             log.error('Cannot update group metadata for Nvd feed due to insufficient access or invalid credentials: {}'.format(e.message))
 
+        try:
+            self.nvdV2.refresh_groups()
+        except (InsufficientAccessTierError, InvalidCredentialsError) as e:
+            log.error('Cannot update group metadata for NvdV2 feed due to insufficient access or invalid credentials: {}'.format(e.message))
+
+        try:
+            self.snyk.refresh_groups()
+        except (InsufficientAccessTierError, InvalidCredentialsError) as e:
+            log.error('Cannot update group metadata for snyk feed due to insufficient access or invalid credentials: {}'.format(e.message))
+
+        try:
+            self.vulndb.refresh_groups()
+        except (InsufficientAccessTierError, InvalidCredentialsError) as e:
+            log.error('Cannot update group metadata for VulnDB feed due to insufficient access or invalid credentials: {}'.format(e.message))
+
     def sync(self, to_sync=None, full_flush=False):
         """
         Sync all feeds.
@@ -1392,36 +1779,157 @@ class DataFeeds(object):
 
         all_success = True
 
-        updated_records = {}
+        result = []
         log.info('Performing feed sync of feeds: {}'.format('all' if to_sync is None else to_sync))
+
+        # Initialize the feed metadata and groups first
+
+        vuln_feed = None
         if to_sync is None or 'vulnerabilities' in to_sync:
             try:
-                log.info('Syncing vulnerability feed')
-                updated_records['vulnerabilities'] = self.vulnerabilities.sync(item_processing_fn=self.vuln_fn, full_flush=full_flush, flush_helper_fn=self.vuln_flush_fn)
+                log.info('Syncing group metadata for vulnerabilities feed')
+                vuln_feed = self.vulnerabilities
+                vuln_feed.init_feed_meta_and_groups()
             except:
-                log.exception('Failure updating the vulnerabilities feed. Continuing with next feed')
-                all_success = False
+                log.exception('Cannot sync group metadata for vulnerabilities feed')
+                vuln_feed = None
 
+        pkgs_feed = None
         if to_sync is None or 'packages' in to_sync:
             try:
-                log.info('Syncing packages feed')
-                updated_records['packages'] = self.packages.sync()
+                log.info('Syncing group metadata for packages feed')
+                pkgs_feed = self.packages
+                pkgs_feed.init_feed_meta_and_groups()
             except:
-                log.exception('Failure updating the packages feed.')
-                all_success = False
+                log.exception('Cannot sync group metadata for packages feed')
+                pkgs_feed = None
 
+        nvd_feed = None
         if to_sync is None or 'nvd' in to_sync:
             try:
-                log.info('Syncing nvd feed')
-                updated_records['nvd'] = self.nvd.sync()
+                log.info('Syncing group metadata for nvd feed')
+                nvd_feed = self.nvd
+                nvd_feed.init_feed_meta_and_groups()
             except:
-                log.exception('Failure updating the nvd feed.')
+                log.exception('Cannot sync group metadata for nvd feed')
+                nvd_feed = None
+
+        nvdV2_feed = None
+        if to_sync is None or 'nvdv2' in to_sync:
+            try:
+                log.info('Syncing group metadata for nvdv2 feed')
+                nvdV2_feed = self.nvdV2
+                nvdV2_feed.init_feed_meta_and_groups()
+            except:
+                log.exception('Cannot sync group metadata for nvdV2 feed')
+                nvdV2_feed = None
+
+        snyk_feed = None
+        if to_sync is None or 'snyk' in to_sync:
+            try:
+                log.info('Syncing group metadata for snyk feed')
+                snyk_feed = self.snyk
+                snyk_feed.init_feed_meta_and_groups()
+            except:
+                log.warn('Cannot sync group metadata for snyk feed, may not be available in the feed source')
+                log.debug(traceback.format_exc())
+                snyk_feed = None
+
+        vulndb_feed = None
+        if to_sync is None or 'vulndb' in to_sync:
+            try:
+                log.info('Syncing group metadata for vulndb feed')
+                vulndb_feed = self.vulndb
+                vulndb_feed.init_feed_meta_and_groups()
+            except:
+                log.exception('Cannot sync group metadata for vulndb feed')
+                vulndb_feed = None
+
+        # Perform the feed sync next
+
+        if vuln_feed:
+            t = time.time()
+            try:
+                log.info('Syncing vulnerability feed')
+
+                result.append(vuln_feed.sync(item_processing_fn=self.vuln_fn, full_flush=full_flush, flush_helper_fn=self.vuln_flush_fn))
+            except:
+                log.exception('Failure updating the vulnerabilities feed')
                 all_success = False
+                fail_result = build_feed_sync_results()
+                fail_result['feed'] = vuln_feed.__feed_name__
+                fail_result['total_time_seconds'] = time.time() - t
+                result.append(fail_result)
+
+        if pkgs_feed:
+            t = time.time()
+            try:
+                log.info('Syncing packages feed')
+                result.append(pkgs_feed.sync(full_flush=full_flush))
+            except:
+                log.exception('Failure updating the packages feed')
+                all_success = False
+                fail_result = build_feed_sync_results()
+                fail_result['feed'] = pkgs_feed.__feed_name__
+                fail_result['total_time_seconds'] = time.time() - t
+                result.append(fail_result)
+
+        if nvd_feed:
+            t = time.time()
+            try:
+                log.info('Syncing nvd feed')
+                result.append(nvd_feed.sync(full_flush=full_flush))
+            except:
+                log.exception('Failure updating the nvd feed')
+                all_success = False
+                fail_result = build_feed_sync_results()
+                fail_result['feed'] = nvd_feed.__feed_name__
+                fail_result['total_time_seconds'] = time.time() - t
+                result.append(fail_result)
+
+        if nvdV2_feed:
+            t = time.time()
+            try:
+                log.info('Syncing nvdv2 feed')
+                result.append(nvdV2_feed.sync(full_flush=full_flush))
+            except:
+                log.exception('Failure updating the nvdv2 feed')
+                all_success = False
+                fail_result = build_feed_sync_results()
+                fail_result['feed'] = nvdV2_feed.__feed_name__
+                fail_result['total_time_seconds'] = time.time() - t
+                result.append(fail_result)
+
+        if snyk_feed:
+            t = time.time()
+            try:
+                log.info('Syncing snyk feed')
+                result.append(snyk_feed.sync(item_processing_fn=self.vuln_fn, full_flush=full_flush, flush_helper_fn=self.vuln_flush_fn))
+            except:
+                log.exception('Failure updating the snyk feed')
+                all_success = False
+                fail_result = build_feed_sync_results()
+                fail_result['feed'] = snyk_feed.__feed_name__
+                fail_result['total_time_seconds'] = time.time() - t
+                result.append(fail_result)
+
+        if vulndb_feed:
+            t = time.time()
+            try:
+                log.info('Syncing vulndb feed')
+                result.append(vulndb_feed.sync(full_flush=full_flush))
+            except:
+                log.exception('Failure updating the vulndb feed')
+                all_success = False
+                fail_result = build_feed_sync_results()
+                fail_result['feed'] = vulndb_feed.__feed_name__
+                fail_result['total_time_seconds'] = time.time() - t
+                result.append(fail_result)
 
         if not all_success:
             raise Exception("one or more feeds failed to sync")
 
-        return updated_records
+        return result
 
     def bulk_sync(self, to_sync=None, only_if_unsynced=True):
         """
@@ -1470,6 +1978,42 @@ class DataFeeds(object):
             else:
                 log.info('Skipping bulk sync since feed already initialized')
 
+        if to_sync is None or 'nvdv2' in to_sync:
+            if not only_if_unsynced or self.nvdV2.never_synced():
+                try:
+                    log.info('Syncing nvdV2 feed')
+                    updated_records['nvd'] = self.nvdV2.bulk_sync()
+                except Exception as err:
+                    log.exception('Failure updating the nvdV2 feed. Continuing with next feed')
+                    all_success = False
+
+            else:
+                log.info('Skipping bulk sync since feed already initialized')
+
+        if to_sync is None or 'snyk' in to_sync:
+            if not only_if_unsynced or self.snyk.never_synced():
+                try:
+                    log.info('Syncing snyk feed')
+                    updated_records['snyk'] = self.snyk.bulk_sync()
+                except Exception as err:
+                    log.exception('Failure updating the snyk feed. Continuing with next feed')
+                    all_success = False
+
+            else:
+                log.info('Skipping bulk sync since feed already initialized')
+
+        if to_sync is None or 'vulndb' in to_sync:
+            if not only_if_unsynced or self.vulndb.never_synced():
+                try:
+                    log.info('Syncing vulndb feed')
+                    updated_records['nvd'] = self.vulndb.bulk_sync()
+                except Exception as err:
+                    log.exception('Failure updating the vulndb feed. Continuing with next feed')
+                    all_success = False
+
+            else:
+                log.info('Skipping bulk sync since feed already initialized')
+
         if not all_success:
             raise Exception("one or more feeds failed to sync")
 
@@ -1486,3 +2030,15 @@ class DataFeeds(object):
     @property
     def nvd(self):
         return self._nvdsFeed_cls()
+
+    @property
+    def nvdV2(self):
+        return self._nvdV2sFeed_cls()
+
+    @property
+    def snyk(self):
+        return self._snyksFeed_cls()
+
+    @property
+    def vulndb(self):
+        return self._vulndbFeed_cls()

@@ -31,13 +31,13 @@ class NotLatestTrigger(BaseTrigger):
 
         feed_names = {p.name: p.latest for p in feed_gems}
 
-        for gem, versions in img_gems.items():
+        for gem, versions in list(img_gems.items()):
             if gem not in feed_names:
                 continue # Not an official
 
             for v in versions:
                 if v and v != feed_names.get(gem):
-                    self._fire("Package ("+gem+") version ("+v+") installed but is not the latest version ("+feed_names[gem]['latest']+")")
+                    self._fire(msg="Package ({}) version ({}) installed but is not the latest version ({})".format(gem, v, feed_names[gem]['latest']))
 
 
 class NotOfficialTrigger(BaseTrigger):
@@ -63,7 +63,7 @@ class NotOfficialTrigger(BaseTrigger):
 
         feed_names = {p.name: p.versions_json for p in feed_gems}
 
-        for gem in img_gems.keys():
+        for gem in list(img_gems.keys()):
             if gem not in feed_names:
                 self._fire(msg="GEMNOTOFFICIAL Package ("+str(gem)+") in container but not in official GEM feed.")
 
@@ -90,7 +90,7 @@ class BadVersionTrigger(BaseTrigger):
 
         feed_names = {p.name: p.versions_json for p in feed_gems}
 
-        for gem, versions in img_gems.items():
+        for gem, versions in list(img_gems.items()):
             if gem not in feed_names:
                 continue
 
@@ -113,7 +113,7 @@ class BlacklistedGemTrigger(BaseTrigger):
         :param context:
         :return:
         """
-        gems = image_obj.gems
+        gems = image_obj.get_packages_by_type('gem')
         if not gems:
             return
 
@@ -168,15 +168,25 @@ class GemCheckGate(Gate):
             :return:
             """
 
-            if not image_obj.gems:
+            db_gems = image_obj.get_packages_by_type('gem') 
+            if not db_gems:
                 return context
 
-            context.data[GEM_LIST_KEY] = {p.name: p.versions_json for p in image_obj.gems}
+            #context.data[GEM_LIST_KEY] = {p.name: p.versions_json for p in image_obj.gems}
+
+            # update to handle multiple records with the same version (but in different locations)
+            gem_list_key_data = {}
+            for p in db_gems:
+                if p.name not in gem_list_key_data:
+                    gem_list_key_data[p.name] = []
+                gem_list_key_data[p.name].append(p.version)
+
+            context.data[GEM_LIST_KEY] = gem_list_key_data
             context.data[GEM_MATCH_KEY] = []
-            gems = context.data[GEM_LIST_KEY].keys()
+            gems = list(context.data[GEM_LIST_KEY].keys())
 
             # Use a chunked fetch approach to avoid a single large in() statement with 1000+ keys
-            chunks = [gems[i: i+100] for i in xrange(0, len(gems), 100)]
+            chunks = [gems[i: i+100] for i in range(0, len(gems), 100)]
             for key_range in chunks:
                 context.data[GEM_MATCH_KEY] += context.db.query(GemMetadata).filter(GemMetadata.name.in_(key_range)).all()
 

@@ -3,7 +3,7 @@ from anchore_engine.services.policy_engine.engine.policy.gate import BaseTrigger
 from anchore_engine.services.policy_engine.engine.policy.params import NameVersionStringListParameter, \
     CommaDelimitedStringListParameter, EnumCommaDelimStringListParameter, EnumStringParameter, TypeValidator, TriggerParameter
 from anchore_engine.db import ImagePackage, ImagePackageManifestEntry
-from anchore_engine.services.policy_engine.engine.util.packages import compare_package_versions
+from anchore_engine.util.packages import compare_package_versions
 from anchore_engine.services.policy_engine.engine.logs import get_logger
 
 log = get_logger()
@@ -111,10 +111,11 @@ class VerifyTrigger(BaseTrigger):
             fs_mode = fs_entry.get('mode')
             if meta_db_entry.mode and fs_mode:
                 # Convert to octal for consistent checks
-                oct_fs_mode = oct(fs_mode)
-                oct_db_mode = oct(meta_db_entry.mode)
+                oct_fs_mode = oct(fs_mode)[2:]
+                oct_db_mode = oct(meta_db_entry.mode)[2:]
 
                 # Trim mismatched lengths in octal mode
+                # Add 2 to handle the '0o' prefix that oct() outputs in py3
                 if len(oct_db_mode) < len(oct_fs_mode):
                     oct_fs_mode = oct_fs_mode[-len(oct_db_mode):]
                 elif len(oct_db_mode) > len(oct_fs_mode):

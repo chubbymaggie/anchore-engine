@@ -1,34 +1,36 @@
 import connexion
 
-import anchore_engine.clients.catalog
-import anchore_engine.services.common
+import anchore_engine.apis
+import anchore_engine.clients.services.catalog
+import anchore_engine.common
 import anchore_engine.configuration.localconfig
+import anchore_engine.common.images
 import anchore_engine.subsys.servicestatus
 from anchore_engine.subsys import logger
+from anchore_engine.apis.authorization import get_authorizer, INTERNAL_SERVICE_ALLOWED
 
+authorizer = get_authorizer()
+
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def status():
     httpcode = 500
     try:
-        localconfig = anchore_engine.configuration.localconfig.get_config()
-        return_object = anchore_engine.subsys.servicestatus.get_status({'hostid': localconfig['host_id'], 'servicename': 'analyzer'})
-        #return_object = {
-        #    'busy':False,
-        #    'up':True,
-        #    'message': 'all good'
-        #}
+        service_record = anchore_engine.subsys.servicestatus.get_my_service_record()
+        return_object = anchore_engine.subsys.servicestatus.get_status(service_record)
         httpcode = 200
     except Exception as err:
         return_object = str(err)
 
     return(return_object, httpcode)
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def interactive_analyze(bodycontent):
 
     try:
         return_object = {}
         httpcode = 500
 
-        request_inputs = anchore_engine.services.common.do_request_prep(connexion.request, default_params={})
+        request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
 
         user_auth = request_inputs['auth']
         method = request_inputs['method']
@@ -47,11 +49,11 @@ def interactive_analyze(bodycontent):
 
             try:
                 # image prep
-                registry_creds = anchore_engine.clients.catalog.get_registry(user_auth)
-                image_info = anchore_engine.services.common.get_image_info(userId, "docker", tag, registry_lookup=True, registry_creds=registry_creds)
+                registry_creds = anchore_engine.clients.services.catalog.get_registry(user_auth)
+                image_info = anchore_engine.common.images.get_image_info(userId, "docker", tag, registry_lookup=True, registry_creds=registry_creds)
                 pullstring = image_info['registry'] + "/" + image_info['repo'] + "@" + image_info['digest']
                 fulltag = image_info['registry'] + "/" + image_info['repo'] + ":" + image_info['tag']            
-                new_image_record = anchore_engine.services.common.make_image_record(userId, 'docker', fulltag, registry_lookup=False, registry_creds=(None, None))
+                new_image_record = anchore_engine.common.images.make_image_record(userId, 'docker', fulltag, registry_lookup=False, registry_creds=(None, None))
                 image_detail = new_image_record['image_detail'][0]
                 if not image_detail:
                     raise Exception("no image found matching input")

@@ -2,7 +2,7 @@
 Common base type interfaces for object storage driver providers
 """
 
-from urlparse import urlparse
+from urllib.parse import urlparse
 
 
 class ObjectStorageDriverMeta(type):
@@ -32,14 +32,14 @@ class ObjectStorageDriverMeta(type):
         """
 
         parsed = urlparse(url)
-        for d in cls.registry.values():
+        for d in list(cls.registry.values()):
             if d.__uri_scheme__ == parsed.scheme:
                 return d
 
         return None
 
 
-class ObjectStorageDriver(object):
+class ObjectStorageDriver(object, metaclass=ObjectStorageDriverMeta):
     """
     Interface spec for an object storage driver for simple key/value storage of content.
 
@@ -59,13 +59,12 @@ class ObjectStorageDriver(object):
 
 
     """
-    __metaclass__ = ObjectStorageDriverMeta
 
     __config_name__ = None
     __uri_scheme__ = None
     __supports_compressed_data__ = True # Used mostly for the legacy db drivers that do implicit compression but take text content
 
-    def __init__(self, config):
+    def __init__(self, config: dict):
         """
         Initialize the driver given the driver-specifc section of the archive configuration in the config doc.
 
@@ -74,48 +73,48 @@ class ObjectStorageDriver(object):
         self.config = config
         self.initialized = False
 
-    def put(self, userId, bucket, key, data):
+    def put(self, userId: str, bucket: str, key: str, data: bytes) -> str:
         """
         Save the data in backend under key identified by userId, bucket, key
 
         :param userId:
         :param bucket:
         :param key:
-        :param data: a read() compatible object (StringIO, file, etc)
+        :param data: bytes object
         :return: URI that can be used to lookup the data directy in the backend using get_by_uri() if desired.
         """
         raise NotImplementedError()
 
-    def get(self, userId, bucket, key):
+    def get(self, userId: str, bucket: str, key: str) -> bytes:
         """
-        Return a read-able object wth content for the specified key
+        Return a read-able object wth content for the specified key, as bytes
 
         :param userId:
         :param bucket:
         :param key:
-        :return:
+        :return: bytes object of content
         """
         raise NotImplementedError()
 
-    def get_by_uri(self, uri):
+    def get_by_uri(self, uri: str) -> bytes:
         """
-        Reutrn a read-able object associated with the URI for the content of the object
+        Returns a bytes object associated with the URI for the content of the object
 
         :param uri:
         :return:
         """
         raise NotImplementedError()
 
-    def delete(self, userId, bucket, key):
+    def delete(self, userId: str, bucket: str, key: str) -> bool:
         raise NotImplementedError()
 
-    def delete_by_uri(self, uri):
+    def delete_by_uri(self, uri: str) -> bool:
         raise NotImplementedError()
 
-    def exists(self, uri):
+    def exists(self, uri: str) -> bool:
         raise NotImplementedError()
 
-    def uri_for(self, userId, bucket, key):
+    def uri_for(self, userId: str, bucket: str, key: str) -> str:
         """
         Return a URI for the identified resource.
 

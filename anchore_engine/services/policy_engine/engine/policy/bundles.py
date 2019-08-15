@@ -5,8 +5,8 @@ import re
 import itertools
 from anchore_engine.services.policy_engine.engine.policy.gate import Gate, TriggerMatch
 from anchore_engine.services.policy_engine.engine.logs import get_logger
-from anchore_engine.services.policy_engine.engine.util.docker import parse_dockerimage_string
-from anchore_engine.services.policy_engine.engine.util.matcher import regexify, is_match
+from anchore_engine.util.docker import parse_dockerimage_string
+from anchore_engine.util.matcher import regexify, is_match
 from anchore_engine.services.policy_engine.engine.policy.formatting import policy_json_to_txt, whitelist_json_to_txt
 from anchore_engine.services.policy_engine.engine.policy.gate import BaseTrigger
 
@@ -69,8 +69,7 @@ class SimpleMemoryBundleCache(object):
 class WhitelistAwarePolicyDecider(object):
     @classmethod
     def decide(cls, decisions):
-        candidate_actions = map(lambda x: x.action,
-                                filter(lambda d: not getattr(d, 'is_whitelisted', False), decisions))
+        candidate_actions = [x.action for x in [d for d in decisions if not getattr(d, 'is_whitelisted', False)]]
         if candidate_actions:
             return min(candidate_actions)
         else:
@@ -220,7 +219,7 @@ class BundleDecision(object):
         self.whitelisted_image = whitelist_match if whitelist_match else None
         self.blacklisted_image = blacklist_match if blacklist_match else None
 
-        self.final_policy_decision = max([d.final_decision for d in self.policy_decisions])
+        self.final_policy_decision = min([d.final_decision for d in self.policy_decisions])
 
         if self.blacklisted_image:
             self.final_decision = GateAction.stop
@@ -358,7 +357,7 @@ class PolicyRule(object):
             self.action = getattr(GateAction, action)
         except KeyError:
             raise InvalidGateAction(gate=self.gate_name, trigger=self.trigger_name, rule_id=self.rule_id, action=action,
-                                    valid_actions=filter(lambda x: not x.startswith('_'), GateAction.__dict__.keys()))
+                                    valid_actions=[x for x in list(GateAction.__dict__.keys()) if not x.startswith('_')])
 
         self.error_exc = None
         self.errors = []
@@ -407,9 +406,8 @@ class ExecutablePolicyRule(PolicyRule):
         try:
             try:
                 self.configured_trigger = selected_trigger_cls(parent_gate_cls=self.gate_cls, rule_id=self.rule_id, **self.trigger_params)
-            except [TriggerNotFoundError, InvalidParameterError, ParameterValueInvalidError] as e:
+            except (TriggerNotFoundError, InvalidParameterError, ParameterValueInvalidError) as e:
                 # Error finding or initializing the trigger
-                log.exception('Policy rule execution exception: {}'.format(e))
                 self.error_exc = e
                 self.configured_trigger = None
 
@@ -456,7 +454,7 @@ class ExecutablePolicyRule(PolicyRule):
                 raise
             except Exception as e:
                 log.exception('Unmapped exception caught during trigger evaluation')
-                raise TriggerEvaluationError(trigger=self.configured_trigger, message='Could not evaluate trigger due to error in evaluation execution')
+                raise TriggerEvaluationError(trigger=self.configured_trigger, message='Could not evaluate trigger')
 
             matches = self.configured_trigger.fired
             decisions = []
@@ -589,7 +587,7 @@ class ExecutablePolicy(VersionedEntityMixin):
 
         results = []
         errors = []
-        for gate, policy_rules in self.gates.items():
+        for gate, policy_rules in list(self.gates.items()):
             # Initialize the gate object
             gate_obj = gate()
             exec_context = gate_obj.prepare_context(image_obj, context)
@@ -775,7 +773,7 @@ class ExecutableMapping(object):
         else:
             target_tag = tag
 
-        result = filter(lambda y: y.matches(image_obj, target_tag), self.mapping_rules)
+        result = [y for y in self.mapping_rules if y.matches(image_obj, target_tag)]
 
         # Could have more than one match, in which case return the first
         if result and len(result) >= 1:
@@ -1110,7 +1108,7 @@ class ExecutableBundle(VersionedEntityMixin):
             for rule in self.mapping.mapping_rules:
                 try:
                     # Build the specified policy for the rule
-                    policies = { policy_id: filter(lambda x: x['id'] == policy_id, self.raw.get('policies', [])) for policy_id in rule.policy_ids }
+                    policies = { policy_id: [x for x in self.raw.get('policies', []) if x['id'] == policy_id] for policy_id in rule.policy_ids }
 
                     for policy_id in rule.policy_ids:
                         if len(policies[policy_id]) > 1:
@@ -1129,7 +1127,7 @@ class ExecutableBundle(VersionedEntityMixin):
                 # Build the whitelists for the rule
                 for wl in rule.whitelist_ids:
                     try:
-                        whitelist = filter(lambda x: x['id'] == wl, self.raw.get('whitelists', []))
+                        whitelist = [x for x in self.raw.get('whitelists', []) if x['id'] == wl]
                         if not whitelist:
                             raise ReferencedObjectNotFoundError(reference_id=wl, reference_type='whitelist')
                         elif len(whitelist) > 1:
@@ -1289,7 +1287,7 @@ def build_empty_error_execution(image_obj, tag, bundle, errors=None, warnings=No
     """
 
     b = BundleExecution(bundle=bundle, image_id=image_obj.id, tag=tag)
-    b.bundle_decision = BundleDecision(policy_decision=FailurePolicyDecision())
+    b.bundle_decision = BundleDecision(policy_decisions=[FailurePolicyDecision()])
     b.errors = errors
     b.warnings = warnings
     return b

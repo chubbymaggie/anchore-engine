@@ -8,12 +8,11 @@ import inspect
 import enum
 
 import anchore_engine
+from anchore_engine.utils import ensure_str, ensure_bytes
 from anchore_engine.subsys import logger
-from anchore_engine.services.policy_engine.engine.policy.params import TriggerParameter
+from anchore_engine.services.policy_engine.engine.policy.params import TriggerParameter, LinkedValidator
 from anchore_engine.services.policy_engine.engine.policy.exceptions import ParameterValueInvalidError, InvalidParameterError,  \
     TriggerEvaluationError, PolicyRuleValidationErrorCollection, ValidationError
-from anchore_engine.services.policy_engine.engine.policy.exceptions import EndOfLifedError
-
 
 class LifecycleStates(enum.Enum):
     active = 1
@@ -54,14 +53,14 @@ class GateMeta(type):
         if found is not None:
             return found
         else:
-            found = filter(lambda x: name.lower() in x.__aliases__, cls.registry.values())
+            found = [x for x in list(cls.registry.values()) if name.lower() in x.__aliases__]
             if found:
                 return found[0]
             else:
                 raise KeyError(name)
 
     def registered_gate_names(cls):
-        return cls.registry.keys()
+        return list(cls.registry.keys())
 
 
 class ExecutionContext(object):
@@ -92,7 +91,7 @@ class TriggerMatch(object):
         # Compute a hash-based trigger_id for matching purposes (this is legacy from Anchore CLI)
         if not self.id:
             gate_id = self.trigger.gate_cls.__gate_name__
-            self.id = hashlib.md5(''.join([gate_id, self.trigger.__trigger_name__, self.msg])).hexdigest()
+            self.id = hashlib.md5(ensure_bytes(''.join([gate_id, self.trigger.__trigger_name__, self.msg if self.msg else '']))).hexdigest()
 
     def json(self):
         return {
@@ -119,7 +118,7 @@ class BaseTrigger(LifecycleMixin):
 
     e.g. in class definition:
 
-    tBaseTriggerestparam = TriggerParamter(display_name='should_fire', is_required=False, validator=BooleanValidator())
+    testparam = TriggerParameter(display_name='should_fire', is_required=False, validator=BooleanValidator())
 
     in usage of the instance object:
 
@@ -142,7 +141,6 @@ class BaseTrigger(LifecycleMixin):
         """
         self.gate_cls = parent_gate_cls
         self.msg = None
-        self.eval_params = {}
         self._fired_instances = []
         self.rule_id = rule_id
 
@@ -162,7 +160,7 @@ class BaseTrigger(LifecycleMixin):
             kwargs = {}
 
         # Find all class objects that are params
-        for attr_name, param_obj in params.items():
+        for attr_name, param_obj in list(params.items()):
             for a in param_obj.aliases:
                 param_name_map[a] = param_obj.name
 
@@ -182,15 +180,31 @@ class BaseTrigger(LifecycleMixin):
             except ValidationError as e:
                 invalid_params.append(ParameterValueInvalidError(validation_error=e, gate=self.gate_cls.__gate_name__, trigger=self.__trigger_name__, rule_id=self.rule_id))
 
+        # One last pass to catch any dependent validations after all values are set, to eliminate issues due to eval order
+        for param_obj in filter(lambda x: isinstance(x.validator, LinkedValidator), list(self.parameters().values())):
+
+            # Update the discriminator link to the object member instead of the class member
+            param_obj.validator.inject_discriminator(self.parameters()[param_obj.validator.discriminator_name].value())
+
+            try:
+                param_obj.validator.validate(param_obj._param_value)
+            except ValidationError as e:
+                invalid_params.append(
+                    ParameterValueInvalidError(validation_error=e, gate=self.gate_cls.__gate_name__,
+                                               trigger=self.__trigger_name__, rule_id=self.rule_id))
+
         # Then, check for any parameters provided that are not defined in the trigger.
         if kwargs:
-            given_param_names = set([param_name_map.get(x) for x in kwargs.keys()])
-            for i in given_param_names.difference(set([x.name for x in params.values()])):
+            given_param_names = set([param_name_map.get(x) for x in list(kwargs.keys())])
+            for i in given_param_names.difference(set([x.name for x in list(params.values())])):
                 # Need to aggregate and return all invalid if there is more than one
-                invalid_params.append(InvalidParameterError(i, params.keys(), trigger=self.__trigger_name__, gate=self.gate_cls.__gate_name__))
+                invalid_params.append(InvalidParameterError(i, list(params.keys()), trigger=self.__trigger_name__, gate=self.gate_cls.__gate_name__))
 
         if invalid_params:
             raise PolicyRuleValidationErrorCollection(invalid_params, trigger=self.__trigger_name__, gate=self.gate_cls.__gate_name__)
+
+    def _get_param_by_name(self, name):
+        return self.parameters()[name]
 
     @classmethod
     def _parameters(cls):
@@ -200,14 +214,14 @@ class BaseTrigger(LifecycleMixin):
         :return: dict of (name -> obj) tuples enumerating all TriggerParameter objects defined for this class
         """
 
-        return {x.name: x.object for x in filter(lambda attr: attr.kind == 'data' and isinstance(attr.object, anchore_engine.services.policy_engine.engine.policy.params.TriggerParameter), inspect.classify_class_attrs(cls))}
+        return {x.name: x.object for x in [attr for attr in inspect.classify_class_attrs(cls) if attr.kind == 'data' and isinstance(attr.object, anchore_engine.services.policy_engine.engine.policy.params.TriggerParameter)]}
 
     def parameters(self):
         """
         Returns a map of display names of the TriggerParameters defined for this Trigger to values
         :return:
         """
-        return {attr_name: getattr(self, attr_name) for attr_name in self._parameters().keys()}
+        return {attr_name: getattr(self, attr_name) for attr_name in list(self._parameters().keys())}
 
     def legacy_str(self):
         """
@@ -233,7 +247,7 @@ class BaseTrigger(LifecycleMixin):
                 self.evaluate(image_obj, context)
             except Exception as e:
                 logger.exception('Error evaluating trigger. Aborting trigger execution')
-                raise TriggerEvaluationError(trigger=self, message='Error executing gate {} trigger {} with params: {}. Msg: {}'.format(self.gate_cls.__gate_name__, self.__trigger_name__, self.eval_params, e.message))
+                raise TriggerEvaluationError(trigger=self, message=str(e))
 
         return True
 
@@ -299,7 +313,7 @@ class BaseTrigger(LifecycleMixin):
         return '<{}.{} object Name:{}, TriggerId:{}, Params:{}>'.format(self.__class__.__module__, self.__class__.__name__, self.__trigger_name__, self.__trigger_id__, self.parameters() if self.parameters() else [])
 
 
-class Gate(LifecycleMixin):
+class Gate(LifecycleMixin, metaclass=GateMeta):
     """
     Base type for a gate module.
     
@@ -322,7 +336,6 @@ class Gate(LifecycleMixin):
     The result of a gate evaluation is an ExecutionResult.
     
     """
-    __metaclass__ = GateMeta
 
     __gate_name__ = None
     __triggers__ = []
@@ -335,7 +348,7 @@ class Gate(LifecycleMixin):
         :param name: 
         :return: 
         """
-        return any(map(lambda x: x.__trigger_name__.lower() == name.lower(), cls.__triggers__))
+        return any([x.__trigger_name__.lower() == name.lower() for x in cls.__triggers__])
 
     @classmethod
     def trigger_names(cls):
@@ -351,7 +364,7 @@ class Gate(LifecycleMixin):
 
         name = name.lower()
 
-        found = filter(lambda x: x.__trigger_name__.lower() == name, cls.__triggers__)
+        found = [x for x in cls.__triggers__ if x.__trigger_name__.lower() == name]
         if found:
             return found[0]
         else:

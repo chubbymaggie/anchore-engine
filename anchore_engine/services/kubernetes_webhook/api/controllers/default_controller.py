@@ -2,17 +2,27 @@ import json
 
 import connexion
 
-from anchore_engine.clients import catalog
+from anchore_engine.apis.authorization import get_authorizer, Permission, RequestingAccountValue
+from anchore_engine.apis.context import ApiRequestContextProxy
+from anchore_engine.clients.services.catalog import CatalogClient
+from anchore_engine.clients.services import internal_client_for
 import anchore_engine.configuration.localconfig
 import anchore_engine.subsys.servicestatus
 import anchore_engine.subsys.metrics
-import anchore_engine.services.common
+import anchore_engine.common
 from anchore_engine.subsys import logger
+from anchore_engine.subsys.identities import manager_factory
+from anchore_engine.db import session_scope
 
+
+authorizer = get_authorizer()
+
+
+@authorizer.requires([])
 def status():
     try:
-        localconfig = anchore_engine.configuration.localconfig.get_config()
-        return_object = anchore_engine.subsys.servicestatus.get_status({'hostid': localconfig['host_id'], 'servicename': 'kubernetes_webhook'})
+        service_record = anchore_engine.subsys.servicestatus.get_my_service_record()
+        return_object = anchore_engine.subsys.servicestatus.get_status(service_record)
         httpcode = 200
     except Exception as err:
         return_object = str(err)
@@ -20,6 +30,8 @@ def status():
 
     return(return_object, httpcode)
 
+
+@authorizer.requires([Permission(domain=RequestingAccountValue(), action='getImageEvaluation', target='*')])
 def imagepolicywebhook(bodycontent):
 
     # TODO - while the image policy webhook feature is in k8s beta, we've decided to make any errors that occur during check still respond with 'allowed: True'.  This should be reverted to default to 'False' on any error, once the k8s feature is further along
@@ -35,7 +47,7 @@ def imagepolicywebhook(bodycontent):
     httpcode = 200
 
     try:
-        request_inputs = anchore_engine.services.common.do_request_prep(connexion.request, default_params={})
+        request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
 
         user_auth = request_inputs['auth']
         method = request_inputs['method']
@@ -61,7 +73,10 @@ def imagepolicywebhook(bodycontent):
                     # see if the request from k8s contains an anchore policy and/or whitelist name
                     if 'annotations' in incoming['spec']:
                         logger.debug("incoming request contains annotations: " + json.dumps(incoming['spec']['annotations'], indent=4))
-                        requestUserId = incoming['spec']['annotations'].pop("anchore.image-policy.k8s.io/userId", None)
+                        requestUserId = incoming['spec']['annotations'].pop("anchore.image-policy.k8s.io/account", None)
+                        if requestUserId is None:
+                            requestUserId = incoming['spec']['annotations'].pop("anchore.image-policy.k8s.io/userId", None)
+
                         requestPolicyId = incoming['spec']['annotations'].pop("anchore.image-policy.k8s.io/policyBundleId", None)
                 except Exception as err:
                     raise Exception("could not parse out annotations: " + str(err))
@@ -69,21 +84,14 @@ def imagepolicywebhook(bodycontent):
                 if not requestUserId:
                     raise Exception("need to specify an anchore.image-policy.k8s.io/userId annotation with a valid anchore service username as a value")
 
-                # TODO - get anchore system uber cred to access
-                # this data on behalf of user?  tough...maybe see
-                # if kuber can make request as anchore-system so
-                # that we can switch roles?
-                localconfig = anchore_engine.configuration.localconfig.get_config()
-                system_user_auth = localconfig['system_user_auth']
-                user_record = catalog.get_user(system_user_auth, requestUserId)
-                request_user_auth = (user_record['userId'], user_record['password'])
+                catalog = internal_client_for(CatalogClient, requestUserId)
 
                 reason = "all images passed anchore policy checks"
                 final_action = False
                 for el in incoming['spec']['containers']:
                     image = el['image']
                     logger.debug("found image in request: " + str(image))
-                    image_records = catalog.get_image(request_user_auth, tag=image)
+                    image_records = catalog.list_images(tag=image)
                     if not image_records:
                         raise Exception("could not find requested image ("+str(image)+") in anchore service DB")
 
@@ -92,7 +100,7 @@ def imagepolicywebhook(bodycontent):
 
                         for image_detail in image_record['image_detail']:
                             fulltag = image_detail['registry'] + "/" + image_detail['repo'] + ':' + image_detail['tag']
-                            result = catalog.get_eval_latest(request_user_auth, tag=fulltag, imageDigest=imageDigest, policyId=requestPolicyId)
+                            result = catalog.get_eval_latest(tag=fulltag, imageDigest=imageDigest, policyId=requestPolicyId)
                             if result:
                                 httpcode = 200
                                 if result['final_action'].upper() not in ['GO', 'WARN']:

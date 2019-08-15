@@ -18,9 +18,38 @@ log_level_map = {
     'DEBUG': 4,
     'SPEW': 99
 }
-log_level = None
+log_level = None # int level for logging
 _log_to_db = None
 _log_to_stdout = False
+
+
+def enable_test_logging(level='WARN', outfile=None):
+    """
+    Use the bootstrap logger for logging in test code (as root logger), for intercept by pytest etc. This code should *only* ever be called in code from test/
+
+    :return:
+    """
+    global bootstrap_logger_enabled, bootstrap_logger, log_level
+
+    if log_level:
+        level = [x for x in list(log_level_map.items()) if x[1] == log_level]
+        # now select the right element of the tuple
+        if level:
+            level = level[0][0]
+            if level == 'SPEW':
+                level = 'DEBUG'
+    else:
+        level = 'INFO'
+
+    prefix = 'test'
+    if outfile:
+        logging.basicConfig(level=level, filename=outfile, format="[{}] %(asctime)s [-] [%(name)s] [%(levelname)s] %(message)s".format(prefix), datefmt='%Y-%m-%d %H:%M:%S+0000')
+    else:
+        logging.basicConfig(level=level, stream=sys.stdout, format="[{}] %(asctime)s [-] [%(name)s] [%(levelname)s] %(message)s".format(prefix), datefmt='%Y-%m-%d %H:%M:%S+0000')
+
+    bootstrap_logger = logging.getLogger()
+    bootstrap_logger_enabled = True
+
 
 def enable_bootstrap_logging(service_name=None):
     """
@@ -32,7 +61,7 @@ def enable_bootstrap_logging(service_name=None):
     global bootstrap_logger_enabled, bootstrap_logger, log_level
 
     if log_level:
-        level = filter(lambda x: x[1] == log_level, log_level_map.items())
+        level = [x for x in list(log_level_map.items()) if x[1] == log_level]
         # now select the right element of the tuple
         if level:
             level = level[0][0]
@@ -101,34 +130,8 @@ def _msg(msg_string, msg_log_level='INFO'):
         if _log_to_db:
             # only store logs of higher severity than WARN
             if log_level_map[msg_log_level] < log_level_map['ERROR']:
-                try:
-                    import anchore_engine.configuration.localconfig
-
-                    localconfig = anchore_engine.configuration.localconfig.get_config()
-                    myservices = localconfig['myservices']
-                    system_user_auth = localconfig['system_user_auth']
-                    hostId = localconfig['host_id']
-
-                    if 'catalog' not in myservices:
-                        import anchore_engine.clients.catalog
-
-                        # call the catalog via client to log the error
-
-                        rc = anchore_engine.clients.catalog.add_event(system_user_auth, hostId, ','.join(myservices),
-                                                                      'FATAL', str(themsg))
-                    else:
-                        import anchore_engine.services.common
-                        import anchore_engine.db.db_eventlog
-
-                        # log directly to DB if we're the catalog
-                        with anchore_engine.services.common.session_scope() as dbsession:
-                            anchore_engine.db.db_eventlog.add(hostId, ','.join(myservices), str(themsg), 'FATAL', {},
-                                                              session=dbsession)
-
-                except Exception as err:
-                    # we're in the logger
-                    log.msg("exception in logger: " + str(err))
-
+                # removing old event log stuff since there are no fatal messages in the system
+                pass
 
 #@bootstrap_logger_intercept(logging.DEBUG)
 def spew(msg_string):
@@ -162,6 +165,21 @@ def exception(msg_string):
     return (_msg(msg_string, msg_log_level='ERROR'))
 
 
+@bootstrap_logger_intercept('EXCEPTION')
+def debug_exception(msg_string):
+    """
+    Same as an exception, but only dumps stack at debug level, otherwise just an error
+
+    :param msg_string:
+    :return:
+    """
+    if log_level >= log_level_map.get('DEBUG'):
+        import traceback
+        traceback.print_exc()
+
+    return (_msg(msg_string, msg_log_level='ERROR'))
+
+
 @bootstrap_logger_intercept(logging.FATAL)
 def fatal(msg_string):
     return (_msg(msg_string, msg_log_level='FATAL'))
@@ -176,6 +194,9 @@ def set_log_level(new_log_level, log_to_stdout=False, log_to_db=False):
     :return:
     """
     global log_level, log_level_map, _log_to_stdout, _log_to_db
+
+    # Don't require the level strings to be upper, normalize it here
+    new_log_level = new_log_level.upper()
 
     if new_log_level in log_level_map:
         log_level = log_level_map[new_log_level]

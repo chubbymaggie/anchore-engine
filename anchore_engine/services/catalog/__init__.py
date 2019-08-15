@@ -3,210 +3,119 @@ import os
 import copy
 import threading
 import time
-import traceback
-import uuid
+import pkg_resources
 
-import connexion
-from twisted.internet import reactor
-from twisted.web.wsgi import WSGIResource
-from twisted.web.resource import Resource
-from twisted.web import rewrite
-from twisted.internet.task import LoopingCall
+from sqlalchemy.exc import IntegrityError
 
 # anchore modules
-from anchore_engine.clients import http, simplequeue, policy_engine
-from anchore_engine.clients.policy_engine.generated.rest import ApiException
+import anchore_engine.clients.anchoreio
+import anchore_engine.common.helpers
+import anchore_engine.common.images
+from anchore_engine.clients.services import internal_client_for
+from anchore_engine.clients.services import simplequeue
+from anchore_engine.clients.services.simplequeue import SimpleQueueClient
+from anchore_engine.clients.services.policy_engine import PolicyEngineClient
 import anchore_engine.configuration.localconfig
 import anchore_engine.subsys.servicestatus
 import anchore_engine.subsys.metrics
-import anchore_engine.services.common
-import anchore_engine.clients.common
+import anchore_engine.common
+import anchore_engine.clients.services.common
+from anchore_engine.clients import docker_registry
 from anchore_engine import db
-from anchore_engine.db import db_catalog_image, db_eventlog, db_policybundle, db_policyeval, db_queues, db_registries, db_subscriptions, db_users, db_anchore, db_services
-from anchore_engine.subsys import notifications, taskstate, logger, archive
+from anchore_engine.db import db_catalog_image, db_policybundle, db_queues, db_registries, db_subscriptions, \
+    db_accounts, db_anchore, db_services, db_events, AccountStates, AccountTypes, ArchiveTransitionRule
+from anchore_engine.subsys import notifications, taskstate, logger, archive, object_store
 from anchore_engine.services.catalog import catalog_impl
-import anchore_engine.auth.anchore_io
-
-servicename = 'catalog'
-_default_api_version = "v1"
-
-# service funcs (must be here)
-
-def default_version_rewrite(request):
-    global _default_api_version
-    try:
-        if request.postpath:
-            if request.postpath[0] != 'health' and request.postpath[0] != _default_api_version:
-                request.postpath.insert(0, _default_api_version)
-                request.path = '/'+_default_api_version+request.path
-    except Exception as err:
-        logger.error("rewrite exception: " +str(err))
-        raise err
-
-def createService(sname, config):
-    global servicename
-
-    try:
-        application = connexion.FlaskApp(__name__, specification_dir='swagger/')
-        flask_app = application.app
-        flask_app.url_map.strict_slashes = False
-        anchore_engine.subsys.metrics.init_flask_metrics(flask_app, servicename=servicename)
-        application.add_api('swagger.yaml')
-    except Exception as err:
-        traceback.print_exc()
-        raise err
-
-    flask_site = WSGIResource(reactor, reactor.getThreadPool(), application=flask_app)
-    realroot = Resource()
-    realroot.putChild(b"v1", anchore_engine.services.common.getAuthResource(flask_site, sname, config))
-    realroot.putChild(b"health", anchore_engine.services.common.HealthResource())
-    # this will rewrite any calls that do not have an explicit version to the base path before being processed by flask
-    root = rewrite.RewriterResource(realroot, default_version_rewrite)
-    #root = anchore_engine.services.common.getAuthResource(flask_site, sname, config)
-    return(anchore_engine.services.common.createServiceAPI(root, sname, config))
-
-def initializeService(sname, config):
-    service_record = {'hostid': config['host_id'], 'servicename': sname}
-    try:
-        if not anchore_engine.subsys.servicestatus.has_status(service_record):
-            anchore_engine.subsys.servicestatus.initialize_status(service_record, up=True, available=False, message='initializing')
-    except Exception as err:
-        import traceback
-        traceback.print_exc()
-        raise Exception("could not initialize service status - exception: " + str(err))
-
-    try:
-        archive.initialize(config['services'][sname])
-    except Exception as err:
-        logger.exception("Error initializing archive: check catalog configuration")
-        raise err
-
-    # set up defaults for users if not yet set up
-    try:
-        with db.session_scope() as dbsession:
-            user_records = db_users.get_all(session=dbsession)
-            for user_record in user_records:
-                userId = user_record['userId']
-                if userId == 'anchore-system':
-                    continue
-
-                bundle_records = db_policybundle.get_all_byuserId(userId, session=dbsession)
-                if not bundle_records:
-                    logger.debug("user has no policy bundle - installing default: " +str(userId))
-                    localconfig = anchore_engine.configuration.localconfig.get_config()
-                    if 'default_bundle_file' in localconfig and os.path.exists(localconfig['default_bundle_file']):
-                        logger.info("loading def bundle: " + str(localconfig['default_bundle_file']))
-                        try:
-                            default_bundle = {}
-                            with open(localconfig['default_bundle_file'], 'r') as FH:
-                                default_bundle = json.loads(FH.read())
-                            if default_bundle:
-                                bundle_url = archive.put_document(userId, 'policy_bundles', default_bundle['id'], default_bundle)
-                                policy_record = anchore_engine.services.common.make_policy_record(userId, default_bundle, active=True)
-                                rc = db_policybundle.add(policy_record['policyId'], userId, True, policy_record, session=dbsession)
-                                if not rc:
-                                    raise Exception("policy bundle DB add failed")
-                        except Exception as err:
-                            logger.error("could not load up default bundle for user - exception: " + str(err))
-    except Exception as err:
-        raise Exception ("unable to initialize default user data - exception: " + str(err))
-
-    # set up monitor
-    try:
-        kick_timer = int(config['services'][sname]['cycle_timer_seconds'])
-    except:
-        kick_timer = 1
-    try:
-        cycle_timers = {}
-        cycle_timers.update(config['services'][sname]['cycle_timers'])
-    except:
-        cycle_timers = {}
-
-    kwargs = {
-        'kick_timer':kick_timer,
-        'cycle_timers': cycle_timers
-    }
-
-    lc = LoopingCall(monitor, **kwargs)
-    lc.start(1)
-    #catalog._v1.monitor(**kwargs)
-
-    return(anchore_engine.services.common.initializeService(sname, config))
-
-def registerService(sname, config):
-    rc = anchore_engine.services.common.registerService(sname, config, enforce_unique=False)
-
-    service_record = {'hostid': config['host_id'], 'servicename': sname}
-    anchore_engine.subsys.servicestatus.set_status(service_record, up=True, available=True, update_db=True)
-
-    return (rc)
+import anchore_engine.subsys.events as events
+from anchore_engine.utils import AnchoreException
+from anchore_engine.services.catalog.exceptions import TagManifestParseError, TagManifestNotFoundError, PolicyBundleValidationError
+from anchore_engine.service import ApiService, LifeCycleStages
+from anchore_engine.common.helpers import make_policy_record
+from anchore_engine.subsys.identities import manager_factory
+from anchore_engine.services.catalog import archiver
+from anchore_engine.subsys.object_store.config import DEFAULT_OBJECT_STORE_MANAGER_ID, ANALYSIS_ARCHIVE_MANAGER_ID, ALT_OBJECT_STORE_CONFIG_KEY
 
 ##########################################################
 
 # monitor section
 
-def handle_vulnerability_scan(*args, **kwargs):
-    global feed_sync_updated
 
+def do_user_resources_delete(userId):
+    return_object = {}
+    httpcode = 500
+
+    resourcemaps = [
+        ("subscriptions", db.db_subscriptions.get_all_byuserId, catalog_impl.do_subscription_delete),
+        ("registries", db.db_registries.get_byuserId, catalog_impl.do_registry_delete),
+        ("evaluations", db.db_policyeval.get_all_byuserId, catalog_impl.do_evaluation_delete),
+        ("policybundles", db.db_policybundle.get_all_byuserId, catalog_impl.do_policy_delete),
+        ("images", db.db_catalog_image.get_all_byuserId, catalog_impl.do_image_delete),
+        ("archive", db.db_archivemetadata.list_all_byuserId, catalog_impl.do_archive_delete),
+    ]
+
+    limit = 2048
+    all_total = 0
+    all_deleted = 0
+    for resourcename,getfunc,delfunc in resourcemaps:
+        try:
+            deleted = 0
+            total = 0
+            with db.session_scope() as dbsession:
+                records = getfunc(userId, session=dbsession, limit=limit)
+                total = len(records)
+                for record in records:
+                    delfunc(userId, record, dbsession, force=True)
+                    deleted = deleted + 1
+            return_object['total_{}'.format(resourcename)] = total
+            return_object['total_{}_deleted'.format(resourcename)] = deleted
+            all_total = all_total + total
+            all_deleted = all_deleted + deleted
+            if total or deleted:
+                logger.debug("deleted {} / {} {} records for user {}".format(deleted, total, resourcename, userId))
+
+        except Exception as err:
+            logger.warn("failed to delete resources in {} for user {}, will continue and try again - exception: {}".format(resourcename, userId, err))
+
+    return_object['all_total'] = all_total
+    return_object['all_deleted'] = all_deleted
+    
+    httpcode = 200
+    return(return_object, httpcode)
+
+def handle_account_resource_cleanup(*args, **kwargs):
     watcher = str(kwargs['mythread']['taskType'])
     handler_success = True
-    
+
     timer = time.time()
-    logger.debug("FIRING: " + str(watcher))
+    logger.debug("FIRING: " + str(watcher))    
 
     try:
-        all_ready = anchore_engine.clients.common.check_services_ready(['policy_engine'])
-        if not all_ready:
-            logger.debug("FIRING DONE: feed syncer (skipping due to required services not being available)")
-            try:
-                kwargs['mythread']['last_return'] = False
-            except:
-                pass
-            return(True)
-
+        # iterate over all deleted account records, and perform resource cleanup for that account.  If there are no longer any resources associated with the account id, then finally delete the account record itself
         with db.session_scope() as dbsession:
-            users = db_users.get_all(session=dbsession)
+            mgr = manager_factory.for_session(dbsession)
+            accounts = mgr.list_accounts(with_state=AccountStates.deleting, include_service=False)
 
-        for user in users:
-            userId = user['userId']
-            if userId == 'anchore-system':
-                continue
+        for account in accounts:
+            userId = account['name']
 
-            # vulnerability scans
+            logger.debug("Inspecting account {} for resource cleanup tasks".format(userId))
+            try:
+                return_object, httpcode = do_user_resources_delete(userId)
+                logger.debug("Resources for deleted account cleaned-up: {} - {}".format(return_object, httpcode))
+                if return_object.get('all_total', None) == 0 and return_object.get('all_deleted', None) == 0:
+                    logger.debug("Resources for pending deleted user {} cleared - deleting account".format(userId))
+                    with db.session_scope() as session:
+                        mgr = manager_factory.for_session(session)
+                        mgr.delete_account(userId)
 
-            doperform = False
-            vuln_sub_tags = []
-            for subscription_type in ['vuln_update']:
-                dbfilter = {'subscription_type': subscription_type}
-                with db.session_scope() as dbsession:
-                    subscription_records = db_subscriptions.get_byfilter(userId, session=dbsession, **dbfilter)
-                for subscription_record in subscription_records:
-                    if subscription_record['active']:
-                        image_info = anchore_engine.services.common.get_image_info(userId, "docker", subscription_record['subscription_key'], registry_lookup=False, registry_creds=(None, None))
-                        dbfilter = {'registry': image_info['registry'], 'repo': image_info['repo'], 'tag': image_info['tag']}
-                        if dbfilter not in vuln_sub_tags:
-                            vuln_sub_tags.append(dbfilter)
-
-            for dbfilter in vuln_sub_tags:
-                with db.session_scope() as dbsession:
-                    image_records = db_catalog_image.get_byimagefilter(userId, 'docker', dbfilter=dbfilter, onlylatest=True, session=dbsession)
-                for image_record in image_records:
-                    if image_record['analysis_status'] == taskstate.complete_state('analyze'):
-                        imageDigest = image_record['imageDigest']
-                        fulltag = dbfilter['registry'] + "/" + dbfilter['repo'] + ":" + dbfilter['tag']
-
-                        doperform = True
-                        if doperform:
-                            logger.debug("calling vuln scan perform: " + str(fulltag) + " : " + str(imageDigest))
-                            with db.session_scope() as dbsession:
-                                try:
-                                    rc = catalog_impl.perform_vulnerability_scan(userId, imageDigest, dbsession, scantag=fulltag, force_refresh=False)
-                                except Exception as err:
-                                    logger.warn("vulnerability scan failed - exception: " + str(err))
+                    
+                else:
+                    logger.debug("resources for pending deleted user {} not entirely cleared this cycle".format(userId))
+            except Exception as err:
+                raise Exception("failed to delete user {} resources - exception: {}".format(userId, err))
 
     except Exception as err:
-        logger.warn("failure in feed sync handler - exception: " + str(err))
-
+        logger.warn("failure in handler - exception: " + str(err))
 
     logger.debug("FIRING DONE: " + str(watcher))
     try:
@@ -215,33 +124,133 @@ def handle_vulnerability_scan(*args, **kwargs):
         pass
 
     if anchore_engine.subsys.metrics.is_enabled() and handler_success:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="success")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="success")
     else:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="fail")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="fail")
 
-    return(True)
+    return (True)
+
+def handle_vulnerability_scan(*args, **kwargs):
+    global feed_sync_updated
+
+    watcher = str(kwargs['mythread']['taskType'])
+    handler_success = True
+
+    timer = time.time()
+    logger.debug("FIRING: " + str(watcher))
+
+    try:
+        all_ready = anchore_engine.clients.services.common.check_services_ready(['policy_engine'])
+        if not all_ready:
+            logger.debug("FIRING DONE: feed syncer (skipping due to required services not being available)")
+            try:
+                kwargs['mythread']['last_return'] = False
+            except:
+                pass
+            return (True)
+
+        with db.session_scope() as dbsession:
+            mgr = manager_factory.for_session(dbsession)
+            accounts = mgr.list_accounts(with_state=AccountStates.enabled, include_service=False)
+
+        for account in accounts:
+            userId = account['name']
+
+            # vulnerability scans
+
+            doperform = False
+            vuln_subs = []
+            for subscription_type in ['vuln_update']:
+                dbfilter = {'subscription_type': subscription_type}
+                with db.session_scope() as dbsession:
+                    subscription_records = db_subscriptions.get_byfilter(userId, session=dbsession, **dbfilter)
+                for subscription_record in subscription_records:
+                    if subscription_record['active']:
+                        image_info = anchore_engine.common.images.get_image_info(userId, "docker", subscription_record[
+                            'subscription_key'], registry_lookup=False, registry_creds=(None, None))
+                        dbfilter = {'registry': image_info['registry'], 'repo': image_info['repo'],
+                                    'tag': image_info['tag']}
+                        if (dbfilter, subscription_record['subscription_value']) not in vuln_subs:
+                            vuln_subs.append((dbfilter, subscription_record['subscription_value']))
+
+            for (dbfilter, value) in vuln_subs:
+                with db.session_scope() as dbsession:
+                    image_records = db_catalog_image.get_byimagefilter(userId, 'docker', dbfilter=dbfilter,
+                                                                       onlylatest=False, session=dbsession)
+                if value:
+                    try:
+                        subscription_value = json.loads(value)
+                        digests = set(subscription_value['digests'])
+                    except Exception as err:
+                        digests = set()
+                else:
+                    digests = set()
+
+                # always add latest version of the image
+                if len(image_records) > 0:
+                    digests.add(image_records[0]['imageDigest'])
+                    current_imageDigest = image_records[0]['imageDigest']
+
+                for image_record in image_records:
+                    if image_record['analysis_status'] == taskstate.complete_state('analyze'):
+                        imageDigest = image_record['imageDigest']
+
+                        if imageDigest not in digests:
+                            continue
+                            
+                        fulltag = dbfilter['registry'] + "/" + dbfilter['repo'] + ":" + dbfilter['tag']
+
+                        doperform = True
+                        if doperform:
+                            logger.debug("calling vuln scan perform: " + str(fulltag) + " : " + str(imageDigest))
+                            with db.session_scope() as dbsession:
+                                try:
+                                    rc = catalog_impl.perform_vulnerability_scan(userId, imageDigest, dbsession, scantag=fulltag, force_refresh=False, is_current=(imageDigest==current_imageDigest))
+                                except Exception as err:
+                                    logger.warn("vulnerability scan failed - exception: " + str(err))
+
+    except Exception as err:
+        logger.warn("failure in feed sync handler - exception: " + str(err))
+
+    logger.debug("FIRING DONE: " + str(watcher))
+    try:
+        kwargs['mythread']['last_return'] = handler_success
+    except:
+        pass
+
+    if anchore_engine.subsys.metrics.is_enabled() and handler_success:
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="success")
+    else:
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="fail")
+
+    return (True)
+
 
 def handle_service_watcher(*args, **kwargs):
-    #global latest_service_records
+    # global latest_service_records
 
     cycle_timer = kwargs['mythread']['cycle_timer']
     max_service_heartbeat_timer = 300
     max_service_orphaned_timer = 3600
+    max_service_cleanup_timer = 86400
 
-    while(True):
+    while (True):
         logger.debug("FIRING: service watcher")
 
         localconfig = anchore_engine.configuration.localconfig.get_config()
         verify = localconfig['internal_ssl_verify']
 
         with db.session_scope() as dbsession:
-            system_user = db_users.get('anchore-system', session=dbsession)
-            userId = system_user['userId']
-            password = system_user['password']
+            mgr = manager_factory.for_session(dbsession)
+            event_account = anchore_engine.configuration.localconfig.ADMIN_ACCOUNT_NAME
 
             anchore_services = db_services.get_all(session=dbsession)
             # update the global latest service record dict in services.common
-            #latest_service_records.update({"service_records": copy.deepcopy(anchore_services)})
+            # latest_service_records.update({"service_records": copy.deepcopy(anchore_services)})
 
             # fields to update each tick:
             #
@@ -252,17 +261,20 @@ def handle_service_watcher(*args, **kwargs):
             #
 
             for service in anchore_services:
+                event = None
                 service_update_record = {}
                 if service['servicename'] == 'catalog' and service['hostid'] == localconfig['host_id']:
                     status = anchore_engine.subsys.servicestatus.get_status(service)
-                    service_update_record.update({'heartbeat': int(time.time()), 'status': True, 'status_message': taskstate.complete_state('service_status'), 'short_description': json.dumps(status)})
+                    service_update_record.update({'heartbeat': int(time.time()), 'status': True,
+                                                  'status_message': taskstate.complete_state('service_status'),
+                                                  'short_description': json.dumps(status)})
                 else:
                     try:
                         try:
                             status = json.loads(service['short_description'])
                         except:
                             status = {'up': False, 'available': False}
-                            
+
                         # set to down until the response can be parsed
                         service_update_record['status'] = False
                         service_update_record['status_message'] = taskstate.fault_state('service_status')
@@ -272,8 +284,17 @@ def handle_service_watcher(*args, **kwargs):
                             # NOTE: this is where any service-specific decisions based on the 'status' record could happen - now all services are the same
                             if status['up'] and status['available']:
                                 if time.time() - service['heartbeat'] > max_service_heartbeat_timer:
-                                    logger.warn("no service heartbeat within allowed time period ("+str([service['hostid'], service['base_url']]) + " - disabling service")
-                                    service_update_record['short_description'] = "no heartbeat from service in ({}) seconds".format(max_service_heartbeat_timer)
+                                    logger.warn("no service heartbeat within allowed time period ({}) for service ({}/{}) - disabling service".format(max_service_heartbeat_timer, service['hostid'], service['servicename']))
+                                    service_update_record[
+                                        'short_description'] = "no heartbeat from service in ({}) seconds".format(
+                                        max_service_heartbeat_timer)
+
+                                    # Trigger an event to log the down service
+                                    event = events.ServiceDownEvent(user_id=event_account, name=service['servicename'],
+                                                                        host=service['hostid'],
+                                                                        url=service['base_url'],
+                                                                        cause='no heartbeat from service in ({}) seconds'.format(
+                                                                            max_service_heartbeat_timer))
                                 else:
                                     service_update_record['status'] = True
                                     service_update_record['status_message'] = taskstate.complete_state('service_status')
@@ -282,20 +303,60 @@ def handle_service_watcher(*args, **kwargs):
                                     except:
                                         service_update_record['short_description'] = str(status)
                             else:
-                                if time.time() - service['heartbeat'] > max_service_orphaned_timer:
-                                    logger.warn("no service heartbeat within max allowed time period ("+str([service['hostid'], service['base_url']]) + " - orphaning service")
+                                # handle the down state transitions
+                                if time.time() - service['heartbeat'] > max_service_cleanup_timer:
+                                    # remove the service entirely
+                                    logger.warn("no service heartbeat within allowed time period ({}) for service ({}/{}) - removing service".format(max_service_cleanup_timer, service['hostid'], service['servicename']))
+                                    try:
+                                        # remove the service record from DB
+                                        removed_hostid = service['hostid']
+                                        removed_servicename = service['servicename']
+                                        removed_base_url = service['base_url']
+                                        
+                                        db_services.delete(removed_hostid, removed_servicename, session=dbsession)
+                                        service_update_record = None
+                                        
+                                        # Trigger an event to log the orphaned service, only on transition
+                                        event = events.ServiceRemovedEvent(user_id=event_account, name=removed_servicename,
+                                                                           host=removed_hostid,
+                                                                           url=removed_base_url,
+                                                                           cause='no heartbeat from service in ({}) seconds'.format(
+                                                                               max_service_cleanup_timer))
+                                    except Exception as err:
+                                        logger.warn("attempt to remove service {}/{} failed - exception: {}".format(service.get('hostid'), service.get('servicename'), err))
+                                    
+                                elif time.time() - service['heartbeat'] > max_service_orphaned_timer:
+                                    # transition down service to orphaned
+                                    logger.warn("no service heartbeat within allowed time period ({}) for service ({}/{}) - orphaning service".format(max_service_orphaned_timer, service['hostid'], service['servicename']))
                                     service_update_record['status'] = False
                                     service_update_record['status_message'] = taskstate.orphaned_state('service_status')
-                                    service_update_record['short_description'] = "no heartbeat from service in ({}) seconds".format(max_service_orphaned_timer)
+                                    service_update_record[
+                                        'short_description'] = "no heartbeat from service in ({}) seconds".format(
+                                        max_service_orphaned_timer)
+
+                                    if service['status_message'] != taskstate.orphaned_state('service_status'): 
+                                        # Trigger an event to log the orphaned service, only on transition
+                                        event = events.ServiceOrphanedEvent(user_id=event_account, name=service['servicename'],
+                                                                            host=service['hostid'],
+                                                                            url=service['base_url'],
+                                                                            cause='no heartbeat from service in ({}) seconds'.format(
+                                                                                max_service_orphaned_timer))
 
                         except Exception as err:
-                            logger.warn("could not get/parse service status record for service: - exception: " + str(err))
+                            logger.warn(
+                                "could not get/parse service status record for service: - exception: " + str(err))
 
                     except Exception as err:
-                        logger.warn("could not get service status: " + str(service) + " : exception: " + str(err) + " : " + str(err.__dict__))
-                        service_update_record['status'] = False
-                        service_update_record['status_message'] = taskstate.fault_state('service_status')
-                        service_update_record['short_description'] = "could not get service status"
+                        logger.warn(
+                            "could not get service status: " + str(service) + " : exception: " + str(err) + " : " + str(
+                                err.__dict__))
+                        if service_update_record:
+                            service_update_record['status'] = False
+                            service_update_record['status_message'] = taskstate.fault_state('service_status')
+                            service_update_record['short_description'] = "could not get service status"
+                    finally:
+                        if event:
+                            _add_event(event)
 
                 if service_update_record:
                     service.update(service_update_record)
@@ -303,8 +364,6 @@ def handle_service_watcher(*args, **kwargs):
                         db_services.update_record(service, session=dbsession)
                     except Exception as err:
                         logger.warn("could not update DB: " + str(err))
-                else:
-                    logger.warn("no service_update_record populated - nothing to update")
 
         logger.debug("FIRING DONE: service watcher")
         try:
@@ -313,24 +372,24 @@ def handle_service_watcher(*args, **kwargs):
             pass
 
         time.sleep(cycle_timer)
-    return(True)
+    return (True)
+
 
 def handle_repo_watcher(*args, **kwargs):
     global system_user_auth
 
     watcher = str(kwargs['mythread']['taskType'])
     handler_success = True
-    
+
     timer = time.time()
     logger.debug("FIRING: " + str(watcher))
 
     with db.session_scope() as dbsession:
-        users = db_users.get_all(session=dbsession)
+        mgr = manager_factory.for_session(dbsession)
+        accounts = mgr.list_accounts(with_state=AccountStates.enabled, include_service=False)
 
-    for user in users:
-        userId = user['userId']
-        if userId == 'anchore-system':
-            continue
+    for account in accounts:
+        userId = account['name']
 
         dbfilter = {}
         with db.session_scope() as dbsession:
@@ -347,6 +406,8 @@ def handle_repo_watcher(*args, **kwargs):
             if not subscription_record['active']:
                 continue
 
+            event = None
+
             try:
                 regrepo = subscription_record['subscription_key']
                 if subscription_record['subscription_value']:
@@ -355,15 +416,23 @@ def handle_repo_watcher(*args, **kwargs):
                         subscription_value['autosubscribe'] = False
                     if 'lookuptag' not in subscription_value:
                         subscription_value['lookuptag'] = 'latest'
-                    
+
                 else:
                     subscription_value = {'autosubscribe': False, 'lookuptag': 'latest'}
 
                 stored_repotags = subscription_value.get('repotags', [])
 
                 fulltag = regrepo + ":" + subscription_value.get('lookuptag', 'latest')
-                image_info = anchore_engine.services.common.get_image_info(userId, "docker", fulltag, registry_lookup=False, registry_creds=(None, None))
-                curr_repotags = anchore_engine.auth.docker_registry.get_repo_tags(userId, image_info, registry_creds=registry_creds)
+                image_info = anchore_engine.common.images.get_image_info(userId, "docker", fulltag,
+                                                                         registry_lookup=False,
+                                                                         registry_creds=(None, None))
+                # List tags
+                try:
+                    curr_repotags = docker_registry.get_repo_tags(userId, image_info, registry_creds=registry_creds)
+                except AnchoreException as e:
+                    event = events.ListTagsFail(user_id=userId, registry=image_info.get('registry', None),
+                                                repository=image_info.get('repo', None), error=e.to_dict())
+                    raise e
 
                 autosubscribes = ['analysis_update']
                 if subscription_value['autosubscribe']:
@@ -371,52 +440,73 @@ def handle_repo_watcher(*args, **kwargs):
 
                 repotags = set(curr_repotags).difference(set(stored_repotags))
                 if repotags:
-                    logger.debug("new tags to watch in repo ("+str(regrepo)+"): " + str(repotags))
+                    logger.debug("new tags to watch in repo (" + str(regrepo) + "): " + str(repotags))
                     added_repotags = stored_repotags
-                    
+
                     for repotag in repotags:
                         try:
                             fulltag = image_info['registry'] + "/" + image_info['repo'] + ":" + repotag
                             logger.debug("found new tag in repo: " + str(fulltag))
-                            new_image_info = anchore_engine.services.common.get_image_info(userId, "docker", fulltag, registry_lookup=True, registry_creds=registry_creds)
+                            new_image_info = anchore_engine.common.images.get_image_info(userId, "docker", fulltag,
+                                                                                         registry_lookup=True,
+                                                                                         registry_creds=registry_creds)
                             manifest = None
                             try:
                                 if 'manifest' in new_image_info:
-                                    manifest = json.dumps(new_image_info['manifest'])
+                                    try:
+                                        manifest = json.dumps(new_image_info['manifest'])
+                                    except Exception as err:
+                                        raise TagManifestParseError(cause=err, tag=fulltag,
+                                                                    manifest=new_image_info['manifest'],
+                                                                    msg='Failed to serialize manifest into JSON formatted string')
                                 else:
-                                    raise Exception("no manifest from get_image_info")
-                            except Exception as err:
-                                raise Exception("could not fetch/parse manifest - exception: " + str(err))
+                                    raise TagManifestNotFoundError(tag=fulltag, msg='No manifest from get_image_info')
+                            except AnchoreException as e:
+                                event = events.TagManifestParseFail(user_id=userId, tag=fulltag, error=e.to_dict())
+                                raise
 
                             with db.session_scope() as dbsession:
                                 logger.debug("adding/updating image from repo scan " + str(new_image_info['fulltag']))
 
                                 # add the image
-                                image_records = catalog_impl.add_or_update_image(dbsession, userId, new_image_info['imageId'], tags=[new_image_info['fulltag']], digests=[new_image_info['fulldigest']], manifest=manifest)
+                                image_records = catalog_impl.add_or_update_image(dbsession, userId,
+                                                                                 new_image_info['imageId'],
+                                                                                 tags=[new_image_info['fulltag']],
+                                                                                 digests=[new_image_info['fulldigest']],
+                                                                                 parentdigest=new_image_info.get('parentdigest', None),
+                                                                                 manifest=manifest)
                                 # add the subscription records with the configured default activations
 
-                                for stype in anchore_engine.services.common.subscription_types:
+                                for stype in anchore_engine.common.subscription_types:
                                     activate = False
                                     if stype == 'repo_update':
                                         continue
                                     elif stype in autosubscribes:
                                         activate = True
-                                    db_subscriptions.add(userId, new_image_info['fulltag'], stype, {'active': activate}, session=dbsession)
+                                    db_subscriptions.add(userId, new_image_info['fulltag'], stype, {'active': activate},
+                                                         session=dbsession)
 
                             added_repotags.append(repotag)
                         except Exception as err:
-                            logger.warn("could not add discovered tag from repo ("+str(fulltag)+") - exception: " + str(err))
+                            logger.warn(
+                                "could not add discovered tag from repo (" + str(fulltag) + ") - exception: " + str(
+                                    err))
 
                     # update the subscription record with the latest successfully added image tags
                     with db.session_scope() as dbsession:
                         subscription_value['repotags'] = added_repotags
                         subscription_value['tagcount'] = len(added_repotags)
-                        db_subscriptions.update(userId, regrepo, 'repo_update', {'subscription_value': json.dumps(subscription_value)}, session=dbsession)
+                        db_subscriptions.update(userId, regrepo, 'repo_update',
+                                                {'subscription_value': json.dumps(subscription_value)},
+                                                session=dbsession)
 
                 else:
-                    logger.debug("no new images in watched repo ("+str(regrepo)+"): skipping")
+                    logger.debug("no new images in watched repo (" + str(regrepo) + "): skipping")
             except Exception as err:
                 logger.warn("failed to process repo_update subscription - exception: " + str(err))
+            finally:
+                if event:
+                    _add_event(event)
 
     logger.debug("FIRING DONE: " + str(watcher))
     try:
@@ -425,26 +515,33 @@ def handle_repo_watcher(*args, **kwargs):
         pass
 
     if anchore_engine.subsys.metrics.is_enabled() and handler_success:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="success")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="success")
     else:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="fail")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="fail")
 
-    return(True)
+    return (True)
+
 
 def handle_image_watcher(*args, **kwargs):
     global system_user_auth
 
     watcher = str(kwargs['mythread']['taskType'])
     handler_success = True
-    
+
     timer = time.time()
     logger.debug("FIRING: " + str(watcher))
-    with db.session_scope() as dbsession:
-        users = db_users.get_all(session=dbsession)
 
-    for user in users:
-        userId = user['userId']
-        if userId == 'anchore-system':
+    obj_mgr = object_store.get_manager()
+
+    with db.session_scope() as dbsession:
+        mgr = manager_factory.for_session(dbsession)
+        accounts = mgr.list_accounts(with_state=AccountStates.enabled, include_service=False)
+
+    for account in accounts:
+        userId = account['name']
+        if account['type'] == AccountTypes.service:  # userId == 'anchore-system':
             continue
 
         with db.session_scope() as dbsession:
@@ -473,30 +570,36 @@ def handle_image_watcher(*args, **kwargs):
 
         for registry_record in registry_creds:
             try:
-                registry_status = anchore_engine.auth.docker_registry.ping_docker_registry(registry_record)
-                if not registry_status:
-                    registry_record['record_state_key'] = 'auth_failure'
-                    registry_record['record_state_val'] = str(int(time.time()))
+                registry_status = docker_registry.ping_docker_registry(registry_record)
             except Exception as err:
+                registry_record['record_state_key'] = 'auth_failure'
+                registry_record['record_state_val'] = str(int(time.time()))
                 logger.warn("registry ping failed - exception: " + str(err))
 
         logger.debug("checking tags for update: " + str(userId) + " : " + str(alltags))
         for fulltag in alltags:
+            event = None
             try:
                 logger.debug("checking image latest info from registry: " + fulltag)
 
-                image_info = anchore_engine.services.common.get_image_info(userId, "docker", fulltag, registry_lookup=True, registry_creds=registry_creds)
+                image_info = anchore_engine.common.images.get_image_info(userId, "docker", fulltag,
+                                                                         registry_lookup=True,
+                                                                         registry_creds=registry_creds)
                 logger.spew("checking image: got registry info: " + str(image_info))
 
                 manifest = None
                 try:
                     if 'manifest' in image_info:
-                        manifest = json.dumps(image_info['manifest'])
+                        try:
+                            manifest = json.dumps(image_info['manifest'])
+                        except Exception as err:
+                            raise TagManifestParseError(cause=err, tag=fulltag, manifest=image_info['manifest'],
+                                                        msg='Failed to serialize manifest into JSON formatted string')
                     else:
-                        raise Exception("no manifest from get_image_info")
-                except Exception as err:
-                    manifest=None
-                    raise Exception("could not fetch/parse manifest - exception: " + str(err))
+                        raise TagManifestNotFoundError(tag=fulltag, msg='No manifest from get_image_info')
+                except AnchoreException as e:
+                    event = events.TagManifestParseFail(user_id=userId, tag=fulltag, error=e.to_dict())
+                    raise
 
                 try:
                     dbfilter = {
@@ -509,12 +612,12 @@ def handle_image_watcher(*args, **kwargs):
                     raise Exception("could not prepare db filter for complete lookup check - exception: " + str(err))
 
                 try:
-                    stored_manifest = json.loads(archive.get_document(userId, 'manifest_data', image_info['digest']))
+                    stored_manifest = json.loads(obj_mgr.get_document(userId, 'manifest_data', image_info['digest']))
                     if not stored_manifest:
                         raise Exception("stored manifest is empty")
                 except Exception as err:
                     logger.debug("found empty/invalid stored manifest, storing new: " + str(err))
-                    rc = archive.put_document(userId, 'manifest_data', image_info['digest'], manifest)
+                    rc = obj_mgr.put_document(userId, 'manifest_data', image_info['digest'], manifest)
 
                 logger.debug("checking image: looking up image in db using dbfilter: " + str(dbfilter))
                 with db.session_scope() as dbsession:
@@ -522,7 +625,9 @@ def handle_image_watcher(*args, **kwargs):
                 if record:
                     logger.debug("checking image: found match, no update, nothing to do: " + str(fulltag))
                 else:
-                    logger.info("checking image: found latest digest for tag is not in DB: should update and queue for analysis: tag="+str(fulltag) + " latest_digest="+str(dbfilter['digest']))
+                    logger.info(
+                        "checking image: found latest digest for tag is not in DB: should update and queue for analysis: tag=" + str(
+                            fulltag) + " latest_digest=" + str(dbfilter['digest']))
                     # get the set of existing digests
                     try:
                         last_dbfilter = {}
@@ -533,7 +638,8 @@ def handle_image_watcher(*args, **kwargs):
                         last_annotations = {}
                         is_latest = True
                         with db.session_scope() as dbsession:
-                            last_image_records = db_catalog_image.get_byimagefilter(userId, 'docker', last_dbfilter, session=dbsession)
+                            last_image_records = db_catalog_image.get_byimagefilter(userId, 'docker', last_dbfilter,
+                                                                                    session=dbsession)
 
                         if last_image_records:
                             for last_image_record in last_image_records:
@@ -546,7 +652,8 @@ def handle_image_watcher(*args, **kwargs):
                                     if not last_annotations and last_image_record['annotations']:
                                         try:
                                             if last_image_record.get('annotations', '{}'):
-                                                last_annotations.update(json.loads(last_image_record.get('annotations', '{}')))
+                                                last_annotations.update(
+                                                    json.loads(last_image_record.get('annotations', '{}')))
                                         except:
                                             pass
                                     is_latest = False
@@ -557,7 +664,12 @@ def handle_image_watcher(*args, **kwargs):
                     # add and store the new image
                     with db.session_scope() as dbsession:
                         logger.debug("adding new image from tag watcher " + str(image_info))
-                        image_records = catalog_impl.add_or_update_image(dbsession, userId, image_info['imageId'], tags=[image_info['fulltag']], digests=[image_info['fulldigest']], manifest=manifest, annotations=last_annotations)
+                        image_records = catalog_impl.add_or_update_image(dbsession, userId, image_info['imageId'],
+                                                                         tags=[image_info['fulltag']],
+                                                                         digests=[image_info['fulldigest']],
+                                                                         parentdigest=image_info.get('parentdigest', None),
+                                                                         manifest=manifest,
+                                                                         annotations=last_annotations)
 
                     if image_records:
                         image_record = image_records[0]
@@ -579,23 +691,26 @@ def handle_image_watcher(*args, **kwargs):
                         rc = notifications.queue_notification(userId, fulltag, 'tag_update', npayload)
                         logger.debug("queued image tag update notification: " + fulltag)
 
-                        #inobj = {
+                        # inobj = {
                         #    'userId': userId,
                         #    'subscription_key':fulltag,
                         #    'notificationId': str(uuid.uuid4()),
                         #    'last_eval':last_digests,
                         #    'curr_eval':new_digests,
-                        #}
-                        #if not simplequeue.is_inqueue(system_user_auth, 'tag_update', inobj):
+                        # }
+                        # if not simplequeue.is_inqueue(system_user_auth, 'tag_update', inobj):
                         #    qobj = simplequeue.enqueue(system_user_auth, 'tag_update', inobj)
                         #    logger.debug("queued image tag update notification: " + fulltag)
 
                     except Exception as err:
-                        logger.error("failed to queue tag update notification - exception: " +str(err))
+                        logger.error("failed to queue tag update notification - exception: " + str(err))
                         raise err
 
             except Exception as err:
                 logger.error("failed to check/update image - exception: " + str(err))
+            finally:
+                if event:
+                    _add_event(event)
 
     logger.debug("FIRING DONE: " + str(watcher))
     try:
@@ -604,15 +719,35 @@ def handle_image_watcher(*args, **kwargs):
         pass
 
     if anchore_engine.subsys.metrics.is_enabled() and handler_success:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="success")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="success")
     else:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="fail")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="fail")
 
-    return(True)
+    return (True)
+
+
+def _add_event(event, quiet=True):
+    try:
+        with db.session_scope() as dbsession:
+            db_events.add(event.to_dict(), dbsession)
+
+        logger.debug("queueing event creation notification")
+        npayload = {'event': event.to_dict()}
+        rc = notifications.queue_notification(event.user_id, subscription_key=event.level,
+                                              subscription_type='event_log', payload=npayload)
+    except:
+        if quiet:
+            logger.exception('Ignoring error creating/notifying event: {}'.format(event))
+        else:
+            raise
+
 
 def check_feedmeta_update(dbsession):
     global feed_sync_updated
-    return(feed_sync_updated)
+    return (feed_sync_updated)
+
 
 def check_policybundle_update(userId, dbsession):
     global bundle_user_last_updated
@@ -626,7 +761,7 @@ def check_policybundle_update(userId, dbsession):
             last_bundle_update = active_policy_record['last_updated']
         else:
             logger.warn("user has no active policy - queueing just in case" + str(userId))
-            return(is_updated)
+            return (is_updated)
 
         if userId not in bundle_user_last_updated:
             bundle_user_last_updated[userId] = last_bundle_update
@@ -639,61 +774,79 @@ def check_policybundle_update(userId, dbsession):
             bundle_user_last_updated[userId] = last_bundle_update
             is_updated = True
     except Exception as err:
-        logger.warn("failed to get/parse active policy bundle for user ("+str(userId)+") - exception: " + str(err))
+        logger.warn("failed to get/parse active policy bundle for user (" + str(userId) + ") - exception: " + str(err))
         bundle_user_last_updated[userId] = 0
         is_updated = True
 
-    return(is_updated)
+    return (is_updated)
+
 
 def handle_policyeval(*args, **kwargs):
     global system_user_auth, bundle_user_is_updated, feed_sync_updated
 
     watcher = str(kwargs['mythread']['taskType'])
     handler_success = True
-    
+
     timer = time.time()
     logger.debug("FIRING: " + str(watcher))
 
     try:
-        all_ready = anchore_engine.clients.common.check_services_ready(['policy_engine', 'simplequeue'])
+        all_ready = anchore_engine.clients.services.common.check_services_ready(['policy_engine', 'simplequeue'])
         if not all_ready:
             logger.debug("FIRING DONE: policy eval (skipping due to required services not being available)")
             try:
                 kwargs['mythread']['last_return'] = False
             except:
                 pass
-            return(True)
+            return (True)
 
         with db.session_scope() as dbsession:
             feed_updated = check_feedmeta_update(dbsession)
-            users = db_users.get_all(session=dbsession)
+            mgr = manager_factory.for_session(dbsession)
+            accounts = mgr.list_accounts(with_state=AccountStates.enabled, include_service=False)
 
-        for user in users:
-            userId = user['userId']
-            if userId == 'anchore-system':
-                continue
-
+        for account in accounts:
+            userId = account['name']
             # policy evaluations
 
             doperform = False
-            policy_sub_tags = []
+            policy_subs = []
             for subscription_type in ['policy_eval']:
                 dbfilter = {'subscription_type': subscription_type}
                 with db.session_scope() as dbsession:
                     subscription_records = db_subscriptions.get_byfilter(userId, session=dbsession, **dbfilter)
                 for subscription_record in subscription_records:
                     if subscription_record['active']:
-                        image_info = anchore_engine.services.common.get_image_info(userId, "docker", subscription_record['subscription_key'], registry_lookup=False, registry_creds=(None, None))
-                        dbfilter = {'registry': image_info['registry'], 'repo': image_info['repo'], 'tag': image_info['tag']}
-                        if dbfilter not in policy_sub_tags:
-                            policy_sub_tags.append(dbfilter)
+                        image_info = anchore_engine.common.images.get_image_info(userId, "docker", subscription_record[
+                            'subscription_key'], registry_lookup=False, registry_creds=(None, None))
+                        dbfilter = {'registry': image_info['registry'], 'repo': image_info['repo'],
+                                    'tag': image_info['tag']}
+                        if (dbfilter, subscription_record['subscription_value']) not in policy_subs:
+                            policy_subs.append((dbfilter, subscription_record['subscription_value']))
 
-            for dbfilter in policy_sub_tags:
+            for (dbfilter, value) in policy_subs:
                 with db.session_scope() as dbsession:
-                    image_records = db_catalog_image.get_byimagefilter(userId, 'docker', dbfilter=dbfilter, onlylatest=True, session=dbsession)
+                    image_records = db_catalog_image.get_byimagefilter(userId, 'docker', dbfilter=dbfilter,
+                                                                       onlylatest=False, session=dbsession)
+                if value:
+                    try:
+                        subscription_value = json.loads(value)
+                        digests = set(subscription_value['digests'])
+                    except Exception as err:
+                        digests = set()
+                else:
+                    digests = set()
+
+                # always add latest version of the image
+                if len(image_records) > 0:
+                    digests.add(image_records[0]['imageDigest'])
                 for image_record in image_records:
                     if image_record['analysis_status'] == taskstate.complete_state('analyze'):
                         imageDigest = image_record['imageDigest']
+
+                        if imageDigest not in digests:
+                            continue
+
                         fulltag = dbfilter['registry'] + "/" + dbfilter['repo'] + ":" + dbfilter['tag']
 
                         # TODO - checks to avoid performing eval if nothing has changed
@@ -702,7 +855,8 @@ def handle_policyeval(*args, **kwargs):
                             logger.debug("calling policy eval perform: " + str(fulltag) + " : " + str(imageDigest))
                             with db.session_scope() as dbsession:
                                 try:
-                                    rc = catalog_impl.perform_policy_evaluation(userId, imageDigest, dbsession, evaltag=fulltag)
+                                    rc = catalog_impl.perform_policy_evaluation(userId, imageDigest, dbsession,
+                                                                                evaltag=fulltag)
                                 except Exception as err:
                                     logger.warn("policy evaluation failed - exception: " + str(err))
 
@@ -716,44 +870,53 @@ def handle_policyeval(*args, **kwargs):
         pass
 
     if anchore_engine.subsys.metrics.is_enabled() and handler_success:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="success")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="success")
     else:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="fail")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="fail")
 
-    return(True)    
+    return (True)
+
 
 def handle_analyzer_queue(*args, **kwargs):
     global system_user_auth
 
     watcher = str(kwargs['mythread']['taskType'])
     handler_success = True
-    
+
     timer = time.time()
     logger.debug("FIRING: " + str(watcher))
 
     localconfig = anchore_engine.configuration.localconfig.get_config()
+
+    obj_mgr = object_store.get_manager()
+
     try:
         max_working_time = int(localconfig['image_analyze_timeout_seconds'])
     except:
         max_working_time = 36000
 
-    all_ready = anchore_engine.clients.common.check_services_ready(['policy_engine', 'simplequeue'])
+    all_ready = anchore_engine.clients.services.common.check_services_ready(['policy_engine', 'simplequeue'])
     if not all_ready:
         logger.debug("FIRING DONE: analyzer queuer (skipping due to required services not being available)")
         try:
             kwargs['mythread']['last_return'] = False
         except:
             pass
-        return(True)
+        return (True)
 
     with db.session_scope() as dbsession:
-        users = db_users.get_all(session=dbsession)
+        mgr = manager_factory.for_session(dbsession)
+        accounts = mgr.list_accounts(include_service=False)
 
-    for user in users:
-        userId = user['userId']
-        if userId == 'anchore-system':
+    q_client = internal_client_for(SimpleQueueClient, userId=None)
+    
+    for account in accounts:
+        userId = account['name']
+        if account['type'] == AccountTypes.service:  # userId == 'anchore-system':
             continue
-            
+
         # do this in passes, for each analysis_status state
 
         with db.session_scope() as dbsession:
@@ -765,9 +928,11 @@ def handle_analyzer_queue(*args, **kwargs):
             imageDigest = image_record['imageDigest']
             if image_record['image_status'] == taskstate.complete_state('image_status'):
                 state_time = int(time.time()) - image_record['last_updated']
-                logger.debug("image in working state for ("+str(state_time)+")s - "+str(imageDigest))
+                logger.debug("image in working state for (" + str(state_time) + ")s - " + str(imageDigest))
                 if state_time > max_working_time:
-                    logger.warn("image has been in working state ("+str(taskstate.working_state('analyze'))+") for over ("+str(max_working_time)+") seconds - resetting and requeueing for analysis")
+                    logger.warn("image has been in working state (" + str(
+                        taskstate.working_state('analyze')) + ") for over (" + str(
+                        max_working_time) + ") seconds - resetting and requeueing for analysis")
                     image_record['analysis_status'] = taskstate.reset_state('analyze')
                     with db.session_scope() as dbsession:
                         db_catalog_image.update_record(image_record, session=dbsession)
@@ -775,25 +940,26 @@ def handle_analyzer_queue(*args, **kwargs):
         # next, look for any image in base state (not_analyzed) for queuing
         with db.session_scope() as dbsession:
             dbfilter = {'analysis_status': taskstate.base_state('analyze')}
-            #dbfilter = {}
+            # dbfilter = {}
             basestate_image_records = db_catalog_image.get_byfilter(userId, session=dbsession, **dbfilter)
 
         for basestate_image_record in basestate_image_records:
             imageDigest = basestate_image_record['imageDigest']
 
             image_record = basestate_image_record
-            #dbfilter = {'imageDigest': imageDigest}
-            #with db.session_scope() as dbsession:
+            # dbfilter = {'imageDigest': imageDigest}
+            # with db.session_scope() as dbsession:
             #    image_records = db.db_catalog_image.get_byfilter(userId, session=dbsession, **dbfilter)
             #    image_record = image_records[0]
 
             if image_record['image_status'] == taskstate.complete_state('image_status'):
                 logger.debug("image check")
                 if image_record['analysis_status'] == taskstate.base_state('analyze'):
-                    logger.debug("image in base state - "+str(imageDigest))
+                    logger.debug("image in base state - " + str(imageDigest))
                     try:
-                        manifest = archive.get_document(userId, 'manifest_data', image_record['imageDigest'])
+                        manifest = obj_mgr.get_document(userId, 'manifest_data', image_record['imageDigest'])
                     except Exception as err:
+                        logger.debug("failed to get manifest - {}".format(str(err)))
                         manifest = {}
 
                     qobj = {}
@@ -801,168 +967,21 @@ def handle_analyzer_queue(*args, **kwargs):
                     qobj['imageDigest'] = image_record['imageDigest']
                     qobj['manifest'] = manifest
                     try:
-                        if not simplequeue.is_inqueue(system_user_auth, 'images_to_analyze', qobj):
+                        if not q_client.is_inqueue('images_to_analyze', qobj):
                             # queue image for analysis
                             logger.debug("queued image for analysis: " + str(imageDigest))
-                            qobj = simplequeue.enqueue(system_user_auth, 'images_to_analyze', qobj)
+                            qobj = q_client.enqueue('images_to_analyze', qobj)
 
                             # set the appropriate analysis state for image 
-                            #image_record['analysis_status'] = taskstate.queued_state('analyze')
-                            #image_record['analysis_status'] = taskstate.working_state('analyze')
-                            #with db.session_scope() as dbsession:
+                            # image_record['analysis_status'] = taskstate.queued_state('analyze')
+                            # image_record['analysis_status'] = taskstate.working_state('analyze')
+                            # with db.session_scope() as dbsession:
                             #    rc = db.db_catalog_image.update_record(image_record, session=dbsession)
 
                         else:
                             logger.debug("image already queued")
                     except Exception as err:
                         logger.error("failed to check/queue image for analysis - exception: " + str(err))
-                
-    logger.debug("FIRING DONE: " + str(watcher))
-    try:
-        kwargs['mythread']['last_return'] = handler_success
-    except:
-        pass
-
-    if anchore_engine.subsys.metrics.is_enabled() and handler_success:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="success")
-    else:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="fail")
-
-    return(True)
-
-def sync_policy_bundle(user_auth, anchoreio_user, anchoreio_pw, localconfig):
-    url = localconfig.get('policy_sync_url', None)
-    if not url:
-        raise Exception("cannot read policy_sync_url from loaded configuration")
-
-    client = anchore_engine.auth.anchore_io.get_anchoreio_client(anchoreio_user, anchoreio_pw)
-
-    bundledata = None
-    r = client.authenticated_get(url)
-    if r.get('status_code') == 200 and r.get('success'):
-        bundledataraw = r.get('text')
-        if bundledataraw:
-            bundledata = json.loads(bundledataraw).get('bundle')
-    else:
-        raise Exception("httpcode={} success={} text={}".format(r.get('status_code'), r.get('success', False), r.get('text', "")))
-
-    # schema check
-    try:
-        p_client = policy_engine.get_client(user=user_auth[0], password=user_auth[1])
-        response = p_client.validate_bundle(policy_bundle=bundledata)
-        if not response.valid:
-            raise Exception("validation failed")
-    except ApiException as err:
-        raise Exception('Error response from policy service during bundle validation. Validation could not be performed: {}'.format(err))
-
-    return(bundledata)
-
-def handle_policy_bundle_sync(*args, **kwargs):
-    global system_user_auth, bundle_user_last_updated
-
-    watcher = str(kwargs['mythread']['taskType'])
-    handler_success = True
-    
-    timer = time.time()
-    logger.debug("FIRING: " + str(watcher))
-
-    all_ready = anchore_engine.clients.common.check_services_ready(['policy_engine'])
-    count=0
-    retries=10
-    while (not all_ready) and (count < retries):
-        logger.info("policy engine is not yet ready - retrying {}/{}".format(count, retries))
-        time.sleep(1)
-        count = count + 1
-        all_ready = anchore_engine.clients.common.check_services_ready(['policy_engine'])
-
-    if not all_ready:
-        logger.warn("policy engine not ready after {} retries - will try again next cycle".format(retries))
-        logger.debug("FIRING DONE: " + str(watcher))
-        return(True)
-
-    localconfig = anchore_engine.configuration.localconfig.get_config()
-
-    with db.session_scope() as dbsession:
-        users = db_users.get_all(session=dbsession)
-        for user in users:
-            userId = user['userId']
-            if userId == 'anchore-system':
-                continue
-
-            try:
-                autosync = False
-                try:
-                    autosync = localconfig['credentials']['users'][userId]['auto_policy_sync']
-                except:
-                    pass
-
-                if not autosync:
-                    logger.debug("user ("+str(userId)+") has auto_policy_sync set to false in config - skipping bundle sync")
-                    continue
-                else:
-                    logger.debug("user ("+str(userId)+") has auto_policy_sync set to true in config - attempting bundle sync")
-
-                anchorecredstr = localconfig['credentials']['users'][userId]['external_service_auths']['anchoreio']['anchorecli']['auth']
-                anchore_user, anchore_pw = anchorecredstr.split(':')
-
-                try:
-                    anchore_user_bundle = sync_policy_bundle((user['userId'], user['password']), anchore_user, anchore_pw, localconfig)
-                except Exception as err:
-                    raise Exception("anchore.io bundle sync failed - exception: " + str(err))
-                    
-                #with localanchore.get_anchorelock():
-                #    anchore_user_bundle = localanchore.get_bundle(anchore_user, anchore_pw)
-                #try:
-                #    import anchore.anchore_policy
-                #    rc = anchore.anchore_policy.verify_policy_bundle(bundle=anchore_user_bundle)
-                #    if not rc:
-                #        raise Exception("input bundle does not conform to anchore bundle schema")
-                #except Exception as err:
-                #    raise Exception("cannot run bundle schema verification - exception: " + str(err))
-
-                # TODO should compare here to determine if new bundle is different from stored/active bundle
-                do_update = True
-                try:
-                    current_policy_record = db_policybundle.get_active_policy(userId, session=dbsession)
-                    if current_policy_record:
-                        current_policy_bundle = archive.get_document(userId, 'policy_bundles', current_policy_record['policyId'])
-                        if current_policy_bundle and current_policy_bundle == anchore_user_bundle:
-                            logger.debug("synced bundle is the same as currently installed/active bundle")
-                            do_update = False
-
-                            # special case for upgrade when adding the policy_source column
-                            try:
-                                if current_policy_record['policy_source'] == 'local':
-                                    logger.debug("upgrade case detected - need to write policy_source as anchoreio for existing policy bundle")
-                                    do_update = True
-                            except:
-                                pass
-
-                        else:
-                            logger.debug("synced bundle is different from currently installed/active bundle")
-                            do_update = True
-                except Exception as err:
-                    logger.warn("unable to compare synced bundle with current bundle: " + str(err))
-
-
-                if do_update:
-
-                    logger.spew("synced bundle object: " + json.dumps(anchore_user_bundle, indent=4))
-                    new_policybundle_record = anchore_engine.services.common.make_policy_record(userId, anchore_user_bundle, policy_source="anchore.io", active=True)
-                    logger.spew("created new bundle record: " + json.dumps(new_policybundle_record, indent=4))
-
-                    policyId = new_policybundle_record['policyId']
-                    rc = archive.put_document(userId, 'policy_bundles', policyId, anchore_user_bundle)
-                    logger.debug("bundle record archived: " + str(userId) + " : " + str(policyId))
-                    rc = db_policybundle.update(policyId, userId, True, new_policybundle_record, session=dbsession)
-                    logger.debug("bundle record stored: " + str(userId) + " : " + str(policyId))
-                    if not rc:
-                        raise Exception("DB update failed")
-                    else:
-                        rc = db_policybundle.set_active_policy(policyId, userId, session=dbsession)
-                        bundle_user_last_updated[userId] = 0
-            except Exception as err:
-                logger.warn("no valid bundle available for user ("+str(userId)+") - exception: " + str(err))
 
     logger.debug("FIRING DONE: " + str(watcher))
     try:
@@ -971,98 +990,116 @@ def handle_policy_bundle_sync(*args, **kwargs):
         pass
 
     if anchore_engine.subsys.metrics.is_enabled() and handler_success:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="success")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="success")
     else:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="fail")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="fail")
 
-    return(True)
+    return (True)
+
 
 def handle_notifications(*args, **kwargs):
     global system_user_auth
 
     watcher = str(kwargs['mythread']['taskType'])
     handler_success = True
-    
+
     timer = time.time()
     logger.debug("FIRING: " + str(watcher))
 
+    q_client = internal_client_for(SimpleQueueClient, userId=None)
+
     with db.session_scope() as dbsession:
-        # special handling of the error event queue, if configured as a webhook
+        mgr = manager_factory.for_session(dbsession)
+        localconfig = anchore_engine.configuration.localconfig.get_config()
         try:
-            localconfig = anchore_engine.configuration.localconfig.get_config()
-            try:
-                notification_timeout = int(localconfig['webhooks']['notification_retry_timeout'])
-            except:
-                notification_timeout = 30
+            notification_timeout = int(localconfig['webhooks']['notification_retry_timeout'])
+        except:
+            notification_timeout = 30
 
-            logger.debug("notification timeout: " + str(notification_timeout))
+        logger.debug("notification timeout: " + str(notification_timeout))
 
-            do_erreventhooks = False
-            try:
-                if localconfig['webhooks']['error_event']:
-                    do_erreventhooks = True
-            except:
-                logger.debug("error_event webhook is not configured, skipping webhook for error_event")
+        # get the event log notification config
+        try:
+            event_log_config = localconfig.get('services', {}).get('catalog', {}).get('event_log', None)
+            if event_log_config and 'notification' in event_log_config:
+                notify_events = event_log_config.get('notification').get('enabled', False)
+                if notify_events and 'level' in event_log_config.get('notification'):
+                    event_levels = event_log_config.get('notification').get('level')
+                    event_levels = [level.lower() for level in event_levels]
+                else:
+                    event_levels = None
+            else:
+                notify_events = False
+                event_levels = None
+        except:
+            logger.exception('Ignoring errors parsing for event_log configuration')
+            notify_events = False
+            event_levels = None
 
-            if do_erreventhooks:
-                system_user_record = db_users.get('admin', session=dbsession)
-                errevent_records = db_eventlog.get_all(session=dbsession)
-                for errevent in errevent_records:
-                    notification = errevent
-                    userId = system_user_record['userId']
-                    notificationId = str(uuid.uuid4())
-                    subscription_type = 'error_event'
-                    notification_record = notifications.make_notification(system_user_record, 'error_event', notification)
-                    logger.spew("Storing NOTIFICATION: " + str(system_user_record) + str(notification_record))
-                    db_queues.add(subscription_type, userId, notificationId, notification_record, 0, int(time.time() + notification_timeout), session=dbsession)
-                    db_eventlog.delete_record(errevent, session=dbsession)
-        except Exception as err:
-            logger.warn("failed to queue error eventlog for notification - exception: " + str(err))
-
-        # regular event queue notifications
-        for subscription_type in anchore_engine.services.common.subscription_types + ['error_event']:
+        # regular event queue notifications + event log notification
+        event_log_type = 'event_log'
+        for subscription_type in anchore_engine.common.subscription_types + [event_log_type]:
             logger.debug("notifier: " + subscription_type)
-            users = db_users.get_all(session=dbsession)
+            accounts = mgr.list_accounts(with_state=AccountStates.enabled, include_service=False)
 
             try:
-                qlen = simplequeue.qlen(system_user_auth, subscription_type)
+                qlen = q_client.qlen(subscription_type)
             except Exception as err:
-                logger.debug("problem looking for notifications in queue: " + str(subscription_type) + " - exception: " + str(err))
+                logger.debug(
+                    "problem looking for notifications in queue: " + str(subscription_type) + " - exception: " + str(
+                        err))
                 qlen = 0
 
-            while(qlen > 0):
-                pupdate_record = simplequeue.dequeue(system_user_auth, subscription_type)
+            while (qlen > 0):
+                pupdate_record = q_client.dequeue(subscription_type)
                 if pupdate_record:
                     logger.debug("got notification from queue: " + json.dumps(pupdate_record, indent=4))
                     notification = pupdate_record['data']
                     userId = notification['userId']
                     subscription_key = notification['subscription_key']
                     notificationId = notification['notificationId']
-                    for user in users:
+                    for account in accounts:
                         try:
-                            if userId == user['userId']:
-                                dbfilter = {'subscription_type': subscription_type, 'subscription_key': subscription_key}
-                                subscription_records = db_subscriptions.get_byfilter(user['userId'], session=dbsession, **dbfilter)
-                                if subscription_records:
-                                    subscription = subscription_records[0]
-                                    if subscription and subscription['active']:
-                                        notification_record = notifications.make_notification(user, subscription_type, notification)
-                                        logger.spew("Storing NOTIFICATION: " + str(user) + str(notification_record))
-                                        db_queues.add(subscription_type, userId, notificationId, notification_record, 0, int(time.time() + notification_timeout), session=dbsession)
+                            if userId == account['name']:
+                                notification_record = None
+                                if subscription_type in anchore_engine.common.subscription_types:
+                                    dbfilter = {'subscription_type': subscription_type,
+                                                'subscription_key': subscription_key}
+                                    subscription_records = db_subscriptions.get_byfilter(account['name'],
+                                                                                         session=dbsession, **dbfilter)
+                                    if subscription_records:
+                                        subscription = subscription_records[0]
+                                        if subscription and subscription['active']:
+                                            notification_record = notifications.make_notification(account,
+                                                                                                  subscription_type,
+                                                                                                  notification)
+                                elif subscription_type == event_log_type:  # handle event_log differently since its not a type of subscriptions
+                                    if notify_events and (
+                                            event_levels is None or subscription_key.lower() in event_levels):
+                                        notification.pop('subscription_key',
+                                                         None)  # remove subscription_key property from notification
+                                        notification_record = notifications.make_notification(account, subscription_type,
+                                                                                              notification)
 
+                                if notification_record:
+                                    logger.spew("Storing NOTIFICATION: " + str(account) + str(notification_record))
+                                    db_queues.add(subscription_type, userId, notificationId, notification_record, 0,
+                                                  int(time.time() + notification_timeout), session=dbsession)
                         except Exception as err:
                             import traceback
                             traceback.print_exc()
                             logger.warn("cannot store notification to DB - exception: " + str(err))
 
-                qlen = simplequeue.qlen(system_user_auth, subscription_type)
+                qlen = q_client.qlen(subscription_type)
 
-            for user in users:
-                notification_records = db_queues.get_all(subscription_type, user['userId'], session=dbsession)
+            for account in accounts:
+                notification_records = db_queues.get_all(subscription_type, account['name'], session=dbsession)
                 for notification_record in notification_records:
                     logger.debug("drained to send: " + json.dumps(notification_record))
                     try:
-                        rc = notifications.notify(user, notification_record)
+                        rc = notifications.notify(account, notification_record)
                         if rc:
                             db_queues.delete_record(notification_record, session=dbsession)
                     except Exception as err:
@@ -1081,16 +1118,19 @@ def handle_notifications(*args, **kwargs):
         pass
 
     if anchore_engine.subsys.metrics.is_enabled() and handler_success:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="success")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="success")
     else:
-        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer, function=watcher, status="fail")
+        anchore_engine.subsys.metrics.summary_observe('anchore_monitor_runtime_seconds', time.time() - timer,
+                                                      function=watcher, status="fail")
 
-    return(True)
+    return (True)
+
 
 def handle_metrics(*args, **kwargs):
     cycle_timer = kwargs['mythread']['cycle_timer']
 
-    while(True):
+    while (True):
 
         # perform some DB read/writes for metrics gathering
         if anchore_engine.subsys.metrics.is_enabled():
@@ -1123,7 +1163,6 @@ def handle_metrics(*args, **kwargs):
             except Exception as err:
                 logger.warn("unable to perform DB read/write probe - exception: " + str(err))
 
-
             # FS probes
             localconfig = anchore_engine.configuration.localconfig.get_config()
             try:
@@ -1136,6 +1175,47 @@ def handle_metrics(*args, **kwargs):
 
         time.sleep(cycle_timer)
 
+
+def handle_archive_tasks(*args, **kwargs):
+    """
+
+    Handles periodic scan tasks for archive rule processing
+
+    :param args:
+    :param kwargs:
+    :return:
+    """
+    watcher = str(kwargs['mythread']['taskType'])
+    handler_success = True
+
+    start_time = time.time()
+    logger.debug("FIRING: " + str(watcher))
+    task_id = None
+    try:
+        logger.info('Starting analysis archive transition rule processor')
+        with db.session_scope() as session:
+            # Get accounts that have rules
+            accounts = session.query(ArchiveTransitionRule.account).distinct(ArchiveTransitionRule.account).all()
+            if accounts:
+                accounts = [x[0] for x in accounts]
+            logger.debug('Found accounts {} with transition rules'.format(accounts))
+
+        for account in accounts:
+            task = archiver.ArchiveTransitionTask(account)
+            task_id = task.task_id
+            logger.info('Starting archive transition task {} for account {}'.format(task.task_id, account))
+            task.run()
+            logger.info('Archive transition task {} complete'.format(task.task_id))
+
+    except Exception as ex:
+        logger.exception('Caught unexpected exception')
+    finally:
+        logger.debug('Analysis archive task {} execution time: {} seconds'.format(task_id, time.time() - start_time))
+        logger.debug('Sleeping until next cycle since no messages to process')
+
+    return True
+
+
 click = 0
 running = False
 last_run = 0
@@ -1145,40 +1225,23 @@ feed_sync_updated = False
 bundle_user_last_updated = {}
 bundle_user_is_updated = {}
 
-watchers = {
-    'image_watcher': {'handler': handle_image_watcher, 'task_lease_id': 'image_watcher', 'taskType': 'handle_image_watcher', 'args': [], 'cycle_timer': 600, 'min_cycle_timer': 300, 'max_cycle_timer': 86400*7, 'last_queued': 0, 'last_return': False, 'initialized': False},
-    'repo_watcher': {'handler': handle_repo_watcher, 'task_lease_id': 'repo_watcher', 'taskType': 'handle_repo_watcher', 'args': [], 'cycle_timer': 60, 'min_cycle_timer': 60, 'max_cycle_timer': 86400*7, 'last_queued': 0, 'last_return': False, 'initialized': False},
-    'policy_eval': {'handler':handle_policyeval, 'task_lease_id': 'policy_eval', 'taskType': 'handle_policyeval', 'args': [], 'cycle_timer': 300, 'min_cycle_timer': 60, 'max_cycle_timer': 86400*2, 'last_queued': 0, 'last_return': False, 'initialized': False},
-    'policy_bundle_sync': {'handler':handle_policy_bundle_sync, 'task_lease_id': 'policy_bundle_sync','taskType': 'handle_policy_bundle_sync', 'args': [], 'cycle_timer': 3600, 'min_cycle_timer': 300, 'max_cycle_timer': 86400*2, 'last_queued': 0, 'last_return': False, 'initialized': False},
-    'analyzer_queue': {'handler':handle_analyzer_queue, 'task_lease_id': 'analyzer_queue','taskType': 'handle_analyzer_queue', 'args': [], 'cycle_timer': 5, 'min_cycle_timer': 1, 'max_cycle_timer': 7200, 'last_queued': 0, 'last_return': False, 'initialized': False},
-    'notifications': {'handler':handle_notifications, 'task_lease_id': 'notifications','taskType': 'handle_notifications', 'args': [], 'cycle_timer': 10, 'min_cycle_timer': 10, 'max_cycle_timer': 86400*2, 'last_queued': 0, 'last_return': False, 'initialized': False},
-    'vulnerability_scan': {'handler':handle_vulnerability_scan, 'task_lease_id': 'vulnerability_scan', 'taskType': 'handle_vulnerability_scan', 'args': [], 'cycle_timer': 300, 'min_cycle_timer': 60, 'max_cycle_timer': 86400*2, 'last_queued': 0, 'last_return': False, 'initialized': False},
-    'service_watcher': {'handler':handle_service_watcher, 'task_lease_id': False, 'taskType': None, 'args': [], 'cycle_timer': 10, 'min_cycle_timer': 1, 'max_cycle_timer': 300, 'last_queued': 0, 'last_return': False, 'initialized': False},
-    'service_heartbeat': {'handler': anchore_engine.subsys.servicestatus.handle_service_heartbeat, 'task_lease_id': False, 'taskType': None, 'args': [servicename], 'cycle_timer': 60, 'min_cycle_timer': 60, 'max_cycle_timer': 60, 'last_queued': 0, 'last_return': False, 'initialized': False},
-    'handle_metrics': {'handler': handle_metrics, 'task_lease_id': False, 'taskType': None, 'args': [], 'cycle_timer': 60, 'min_cycle_timer': 60, 'max_cycle_timer': 60, 'last_queued': 0, 'last_return': False, 'initialized': False},
-}
-
-watcher_task_template = {
-    'taskType': None,
-    'watcher': None,
-}
-watcher_threads = {}
-
-default_lease_ttl = 60 # 1 hour ttl, should be more than enough in most cases
+default_lease_ttl = 60  # 1 hour ttl, should be more than enough in most cases
 
 
 def watcher_func(*args, **kwargs):
     global system_user_auth
 
-    while(True):
+    while (True):
         logger.debug("starting generic watcher")
-        all_ready = anchore_engine.clients.common.check_services_ready(['simplequeue'])
+        all_ready = anchore_engine.clients.services.common.check_services_ready(['simplequeue'])
         if not all_ready:
             logger.info("simplequeue service not yet ready, will retry")
         else:
+            q_client = internal_client_for(SimpleQueueClient, userId=None)
+            lease_id = None
             try:
                 logger.debug("attempting dequeue")
-                qobj = simplequeue.dequeue(system_user_auth, 'watcher_tasks', max_wait_seconds=30)
+                qobj = q_client.dequeue('watcher_tasks', max_wait_seconds=30)
                 logger.debug("dequeue complete")
 
                 if qobj:
@@ -1193,24 +1256,29 @@ def watcher_func(*args, **kwargs):
                     # Old way
                     timer = time.time()
                     if not lease_id:
-                        logger.debug('No task lease defined for watcher {}, initiating without lock protection'.format(watcher))
+                        logger.debug(
+                            'No task lease defined for watcher {}, initiating without lock protection'.format(watcher))
                         rc = handler(*args, **kwargs)
                     else:
-                        rc = simplequeue.run_target_with_lease(system_user_auth, lease_id, handler, ttl=default_lease_ttl, *args, **kwargs)
+                        rc = simplequeue.run_target_with_lease(None, lease_id, handler,
+                                                               ttl=default_lease_ttl, *args, **kwargs)
 
                 else:
                     logger.debug("nothing in queue")
+            except (simplequeue.LeaseAcquisitionFailedError, simplequeue.LeaseUnavailableError) as e:
+                logger.debug('Lease acquisition could not complete, but this is probably due to another process with the lease: {}'.format(e))
             except Exception as err:
                 logger.warn("failed to process task this cycle: " + str(err))
         logger.debug("generic watcher done")
         time.sleep(5)
 
+
 def schedule_watcher(watcher):
     global watchers, watcher_task_template, system_user_auth
 
     if watcher not in watchers:
-        logger.warn("input watcher {} not in list of available watchers {}".format(watcher, watchers.keys()))
-        return(False)
+        logger.warn("input watcher {} not in list of available watchers {}".format(watcher, list(watchers.keys())))
+        return (False)
 
     if watchers[watcher]['taskType']:
         logger.debug("should queue job: " + watcher)
@@ -1218,35 +1286,37 @@ def schedule_watcher(watcher):
         watcher_task['watcher'] = watcher
         watcher_task['taskType'] = watchers[watcher]['taskType']
         try:
-            if not simplequeue.is_inqueue(system_user_auth, 'watcher_tasks', watcher_task):
-                qobj = simplequeue.enqueue(system_user_auth, 'watcher_tasks', watcher_task)
-                logger.debug(str(watcher_task)+": init task queued: " + str(qobj))
+            q_client = internal_client_for(SimpleQueueClient, userId=None)
+            if not q_client.is_inqueue('watcher_tasks', watcher_task):
+                qobj = q_client.enqueue('watcher_tasks', watcher_task)
+                logger.debug(str(watcher_task) + ": init task queued: " + str(qobj))
             else:
-                logger.debug(str(watcher_task)+": init task already queued")
+                logger.debug(str(watcher_task) + ": init task already queued")
 
             watchers[watcher]['last_queued'] = time.time()
         except Exception as err:
-            logger.warn("failed to enqueue watcher task: " + str(err))    
+            logger.warn("failed to enqueue watcher task: " + str(err))
 
-    return(True)
+    return (True)
+
 
 def monitor_func(**kwargs):
     global click, running, last_queued, system_user_auth, watchers, last_run
-    
+
     if click < 5:
         click = click + 1
         logger.debug("Catalog monitor starting in: " + str(5 - click))
-        return(True)
+        return (True)
 
     if running or ((time.time() - last_run) < kwargs['kick_timer']):
-        return(True)
+        return (True)
 
     logger.debug("FIRING: catalog_monitor")
     try:
         localconfig = anchore_engine.configuration.localconfig.get_config()
         system_user_auth = localconfig['system_user_auth']
 
-        for watcher in watchers.keys():
+        for watcher in list(watchers.keys()):
             if not watchers[watcher]['initialized']:
                 # first time
                 if 'cycle_timers' in kwargs and watcher in kwargs['cycle_timers']:
@@ -1259,17 +1329,22 @@ def monitor_func(**kwargs):
                         if config_cycle_timer < 0:
                             the_cycle_timer = abs(int(config_cycle_timer))
                         elif config_cycle_timer < min_cycle_timer:
-                            logger.warn("configured cycle timer for handler ("+str(watcher)+") is less than the allowed min ("+str(min_cycle_timer)+") - using allowed min")
+                            logger.warn("configured cycle timer for handler (" + str(
+                                watcher) + ") is less than the allowed min (" + str(
+                                min_cycle_timer) + ") - using allowed min")
                             the_cycle_timer = min_cycle_timer
                         elif config_cycle_timer > max_cycle_timer:
-                            logger.warn("configured cycle timer for handler ("+str(watcher)+") is greater than the allowed max ("+str(max_cycle_timer)+") - using allowed max")
+                            logger.warn("configured cycle timer for handler (" + str(
+                                watcher) + ") is greater than the allowed max (" + str(
+                                max_cycle_timer) + ") - using allowed max")
                             the_cycle_timer = max_cycle_timer
                         else:
                             the_cycle_timer = config_cycle_timer
 
                         watchers[watcher]['cycle_timer'] = the_cycle_timer
                     except Exception as err:
-                        logger.warn("exception setting custom cycle timer for handler ("+str(watcher)+") - using default")
+                        logger.warn(
+                            "exception setting custom cycle timer for handler (" + str(watcher) + ") - using default")
 
                 watchers[watcher]['initialized'] = True
 
@@ -1281,29 +1356,16 @@ def monitor_func(**kwargs):
                     watcher_threads[watcher].start()
                 else:
                     # spin up a specific looping watcher thread
-                    watcher_threads[watcher] = threading.Thread(target=watchers[watcher]['handler'], args=watchers[watcher]['args'], kwargs={'mythread': watchers[watcher]})
+                    watcher_threads[watcher] = threading.Thread(target=watchers[watcher]['handler'],
+                                                                args=watchers[watcher]['args'],
+                                                                kwargs={'mythread': watchers[watcher]})
                     watcher_threads[watcher].start()
 
-            all_ready = anchore_engine.clients.common.check_services_ready(['simplequeue'])
+            all_ready = anchore_engine.clients.services.common.check_services_ready(['simplequeue'])
             if not all_ready:
                 logger.info("simplequeue service not yet ready, will retry")
             elif time.time() - watchers[watcher]['last_queued'] > watchers[watcher]['cycle_timer']:
                 rc = schedule_watcher(watcher)
-
-                #if watchers[watcher]['taskType']:
-                #    logger.debug("should queue job: " + watcher)
-                #    watcher_task = copy.deepcopy(watcher_task_template)
-                #    watcher_task['watcher'] = watcher
-                #    watcher_task['taskType'] = watchers[watcher]['taskType']
-                #    try:
-                #        if not simplequeue.is_inqueue(system_user_auth, 'watcher_tasks', watcher_task):
-                #            qobj = simplequeue.enqueue(system_user_auth, 'watcher_tasks', watcher_task)
-                #            logger.debug(str(watcher_task)+": init task queued: " + str(qobj))
-                #        else:
-                #            logger.debug(str(watcher_task)+": init task already queued")
-                #        watchers[watcher]['last_queued'] = time.time()
-                #    except Exception as err:
-                #        logger.warn("failed to enqueue watcher task: " + str(err))
 
     except Exception as err:
         logger.error(str(err))
@@ -1314,8 +1376,11 @@ def monitor_func(**kwargs):
 
     logger.debug("exiting monitor thread")
 
+
 monitor_thread = None
-def monitor(**kwargs):
+
+
+def monitor(*args, **kwargs):
     global monitor_thread
     try:
         donew = False
@@ -1342,3 +1407,119 @@ def monitor(**kwargs):
         logger.warn("MON thread start exception: " + str(err))
 
 
+class CatalogService(ApiService):
+    __service_name__ = 'catalog'
+    __spec_dir__ = pkg_resources.resource_filename(__name__, 'swagger')
+    __monitor_fn__ = monitor
+
+    def _register_instance_handlers(self):
+        super()._register_instance_handlers()
+
+        self.register_handler(LifeCycleStages.post_db, self._init_object_storage, {})
+        self.register_handler(LifeCycleStages.post_register, self._init_policies, {})
+
+    def _init_object_storage(self):
+        try:
+            did_init = object_store.initialize(self.configuration, manager_id=DEFAULT_OBJECT_STORE_MANAGER_ID, config_keys=[DEFAULT_OBJECT_STORE_MANAGER_ID, ALT_OBJECT_STORE_CONFIG_KEY], allow_legacy_fallback=True)
+            if not did_init:
+                logger.warn('Unexpectedly found the object store already initialized. This is not an expected condition. Continuting with driver: {}'.format(object_store.get_manager().primary_client.__config_name__))
+        except Exception as err:
+            logger.exception("Error initializing the object store: check catalog configuration")
+            raise err
+
+        try:
+            archive.initialize(self.configuration)
+
+        except Exception as err:
+            logger.exception("Error initializing analysis archive: check catalog configuration")
+            raise err
+
+    def _init_policies(self):
+        """
+        Ensure all accounts have a default policy in place
+        :return:
+        """
+
+        obj_mgr = object_store.get_manager()
+
+        with db.session_scope() as dbsession:
+            mgr = manager_factory.for_session(dbsession)
+            for account_dict in mgr.list_accounts(include_service=False):
+                try:
+                    logger.info('Initializing a new account')
+                    userId = account_dict['name']  # Old keys are userId, now that maps to account name
+                    bundle_records = db_policybundle.get_all_byuserId(userId, session=dbsession)
+                    if not bundle_records:
+                        logger.debug("Account {} has no policy bundle - installing default".format(userId))
+
+                        config = self.global_configuration
+                        if config.get('default_bundle_file', None) and os.path.exists(config['default_bundle_file']):
+                            logger.info("loading def bundle: " + str(config['default_bundle_file']))
+                            try:
+                                default_bundle = {}
+                                with open(config['default_bundle_file'], 'r') as FH:
+                                    default_bundle = json.loads(FH.read())
+                                if default_bundle:
+                                    bundle_url = obj_mgr.put_document(userId, 'policy_bundles', default_bundle['id'],
+                                                                      default_bundle)
+                                    policy_record = make_policy_record(userId, default_bundle, active=True)
+                                    rc = db_policybundle.add(policy_record['policyId'], userId, True, policy_record,
+                                                             session=dbsession)
+                                    if not rc:
+                                        raise Exception("policy bundle DB add failed")
+                            except Exception as err:
+                                if isinstance(err, IntegrityError):
+                                    logger.warn("another process has already initialized, continuing")
+                                else:
+                                    logger.error("could not load up default bundle for user - exception: " + str(err))
+                except Exception as err:
+                    if isinstance(err, IntegrityError):
+                        logger.warn("another process has already initialized, continuing")
+                    else:
+                        raise Exception("unable to initialize default user data - exception: " + str(err))
+
+
+watchers = {
+    'image_watcher': {'handler': handle_image_watcher, 'task_lease_id': 'image_watcher',
+                      'taskType': 'handle_image_watcher', 'args': [], 'cycle_timer': 600, 'min_cycle_timer': 300,
+                      'max_cycle_timer': 86400 * 7, 'last_queued': 0, 'last_return': False, 'initialized': False},
+    'repo_watcher': {'handler': handle_repo_watcher, 'task_lease_id': 'repo_watcher', 'taskType': 'handle_repo_watcher',
+                     'args': [], 'cycle_timer': 60, 'min_cycle_timer': 60, 'max_cycle_timer': 86400 * 7,
+                     'last_queued': 0, 'last_return': False, 'initialized': False},
+    'policy_eval': {'handler': handle_policyeval, 'task_lease_id': 'policy_eval', 'taskType': 'handle_policyeval',
+                    'args': [], 'cycle_timer': 300, 'min_cycle_timer': 60, 'max_cycle_timer': 86400 * 2,
+                    'last_queued': 0, 'last_return': False, 'initialized': False},
+    'analyzer_queue': {'handler': handle_analyzer_queue, 'task_lease_id': 'analyzer_queue',
+                       'taskType': 'handle_analyzer_queue', 'args': [], 'cycle_timer': 5, 'min_cycle_timer': 1,
+                       'max_cycle_timer': 7200, 'last_queued': 0, 'last_return': False, 'initialized': False},
+    'notifications': {'handler': handle_notifications, 'task_lease_id': 'notifications',
+                      'taskType': 'handle_notifications', 'args': [], 'cycle_timer': 10, 'min_cycle_timer': 10,
+                      'max_cycle_timer': 86400 * 2, 'last_queued': 0, 'last_return': False, 'initialized': False},
+    'vulnerability_scan': {'handler': handle_vulnerability_scan, 'task_lease_id': 'vulnerability_scan',
+                           'taskType': 'handle_vulnerability_scan', 'args': [], 'cycle_timer': 300,
+                           'min_cycle_timer': 60, 'max_cycle_timer': 86400 * 2, 'last_queued': 0, 'last_return': False,
+                           'initialized': False},
+    'account_resource_cleanup': {'handler': handle_account_resource_cleanup, 'task_lease_id': 'account_resource_cleanup',
+                           'taskType': 'handle_account_resource_cleanup', 'args': [], 'cycle_timer': 30,
+                           'min_cycle_timer': 30, 'max_cycle_timer': 30, 'last_queued': 0, 'last_return': False,
+                           'initialized': False},
+    'service_watcher': {'handler': handle_service_watcher, 'task_lease_id': False, 'taskType': None, 'args': [],
+                        'cycle_timer': 10, 'min_cycle_timer': 1, 'max_cycle_timer': 300, 'last_queued': 0,
+                        'last_return': False, 'initialized': False},
+    'service_heartbeat': {'handler': anchore_engine.subsys.servicestatus.handle_service_heartbeat,
+                          'task_lease_id': False, 'taskType': None, 'args': [CatalogService.__service_name__],
+                          'cycle_timer': 60, 'min_cycle_timer': 60, 'max_cycle_timer': 60, 'last_queued': 0,
+                          'last_return': False, 'initialized': False},
+    'handle_metrics': {'handler': handle_metrics, 'task_lease_id': False, 'taskType': None, 'args': [],
+                       'cycle_timer': 60, 'min_cycle_timer': 60, 'max_cycle_timer': 60, 'last_queued': 0,
+                       'last_return': False, 'initialized': False},
+    'archive_tasks': {'handler': handle_archive_tasks, 'task_lease_id': 'archive_transitions', 'taskType': 'handle_archive_tasks', 'args': [], 'cycle_timer': 43200,
+                           'min_cycle_timer': 60, 'max_cycle_timer': 86400 * 5, 'last_queued': 0, 'last_return': False,
+                           'initialized': False},
+}
+
+watcher_task_template = {
+    'taskType': None,
+    'watcher': None,
+}
+watcher_threads = {}

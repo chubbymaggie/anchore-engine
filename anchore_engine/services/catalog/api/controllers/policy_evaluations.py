@@ -1,19 +1,22 @@
 import connexion
-import time
 
+import anchore_engine.apis
+import anchore_engine.common.helpers
 from anchore_engine import db
 from anchore_engine.db import db_policyeval
 #import catalog_impl
 from anchore_engine.services.catalog import catalog_impl
-from anchore_engine.api_utils import pass_user_context
-import anchore_engine.services.common
-from anchore_engine.subsys import logger
+import anchore_engine.common
+from anchore_engine.subsys import logger, object_store
 import anchore_engine.configuration.localconfig
 import anchore_engine.subsys.servicestatus
+from anchore_engine.apis.authorization import get_authorizer, INTERNAL_SERVICE_ALLOWED
 
-from anchore_engine.subsys.metrics import flask_metrics, flask_metric_name, enabled as flask_metrics_enabled
+authorizer = get_authorizer()
 
-def get_evals(policyId=None, imageDigest=None, tag=None, evalId=None, newest_only=False):
+
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
+def get_evals(policyId=None, imageDigest=None, tag=None, evalId=None, newest_only=False, interactive=False):
     """
     GET /evals
 
@@ -23,16 +26,11 @@ def get_evals(policyId=None, imageDigest=None, tag=None, evalId=None, newest_onl
     httpcode = 500
 
     try:
-        request_inputs = anchore_engine.services.common.do_request_prep(connexion.request, default_params={})
+        request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
         user_id = request_inputs['userId']
 
         with db.session_scope() as session:
-            if newest_only:
-                evals = list_evals_impl(session, userId=user_id, policyId=policyId, imageDigest=imageDigest, tag=tag,
-                                        evalId=evalId)
-            else:
-                evals = list_evals_impl(session, userId=user_id, policyId=policyId, imageDigest=imageDigest, tag=tag, evalId=evalId)
-
+            evals = list_evals_impl(session, userId=user_id, policyId=policyId, imageDigest=imageDigest, tag=tag,evalId=evalId, interactive=interactive, newest_only=newest_only)
             if not evals:
                 httpcode = 404
                 raise Exception("eval not found in DB")
@@ -40,13 +38,14 @@ def get_evals(policyId=None, imageDigest=None, tag=None, evalId=None, newest_onl
         return evals, 200
 
     except Exception as err:
-        return str(anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)), 500
+        return str(anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)), 500
 
     # return (return_object, httpcode)
     #     httpcode = 500
     #     return_object = str(err)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def add_eval(bodycontent):
     """
     POST /evals
@@ -55,7 +54,7 @@ def add_eval(bodycontent):
     """
 
     try:
-        request_inputs = anchore_engine.services.common.do_request_prep(connexion.request, default_params={})
+        request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
         user_id = request_inputs['userId']
 
         with db.session_scope() as session:
@@ -68,6 +67,7 @@ def add_eval(bodycontent):
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def update_eval(bodycontent):
     """
     PUT /evals
@@ -76,7 +76,7 @@ def update_eval(bodycontent):
     :return:
     """
     try:
-        request_inputs = anchore_engine.services.common.do_request_prep(connexion.request, default_params={})
+        request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
         user_id = request_inputs['userId']
 
         with db.session_scope() as session:
@@ -89,6 +89,7 @@ def update_eval(bodycontent):
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def delete_eval(bodycontent):
     """
     DELETE /evals
@@ -98,7 +99,7 @@ def delete_eval(bodycontent):
     httpcode = 500
     try:
 
-        request_inputs = anchore_engine.services.common.do_request_prep(connexion.request, default_params={})
+        request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
         user_id = request_inputs['userId']
         policyId = imageDigest = tag = evalId = None
 
@@ -122,12 +123,14 @@ def delete_eval(bodycontent):
     return (return_object, httpcode)
 
 
-def list_evals_impl(dbsession, userId, policyId=None, imageDigest=None, tag=None, evalId=None, newest_only=False):
+def list_evals_impl(dbsession, userId, policyId=None, imageDigest=None, tag=None, evalId=None, newest_only=False, interactive=False):
     logger.debug("looking up eval record: " + userId)
 
+    object_store_mgr = object_store.get_manager()
 
     # set up the filter based on input
     dbfilter = {}
+    latest_eval_record = latest_eval_result = None
 
     if policyId is not None:
         dbfilter['policyId'] = policyId
@@ -140,7 +143,6 @@ def list_evals_impl(dbsession, userId, policyId=None, imageDigest=None, tag=None
 
     if evalId is not None:
         dbfilter['evalId'] = evalId
-
 
     # perform an interactive eval to get/install the latest
     try:
@@ -156,16 +158,25 @@ def list_evals_impl(dbsession, userId, policyId=None, imageDigest=None, tag=None
         else:
             policyId = None
 
-        rc = catalog_impl.perform_policy_evaluation(userId, imageDigest, dbsession, evaltag=evaltag, policyId=policyId)
-
+        latest_eval_record, latest_eval_result = catalog_impl.perform_policy_evaluation(userId, imageDigest, dbsession, evaltag=evaltag, policyId=policyId, interactive=interactive, newest_only=newest_only)
     except Exception as err:
-        logger.error(
-            "interactive eval failed, will return any in place evaluation records - exception: " + str(err))
+        logger.error("interactive eval failed - exception: {}".format(err))
 
-    records = db_policyeval.tsget_byfilter(userId, session=dbsession, **dbfilter)
-    # Return None instead?
-    #if not records:
-    #    raise Exception("eval not found in DB")
+    records = []
+    if interactive or newest_only:
+        try:
+            latest_eval_record['result'] = latest_eval_result
+            records = [latest_eval_record]
+        except:
+            raise Exception("interactive or newest_only eval requested, but unable to perform eval at this time")
+    else:
+        records = db_policyeval.tsget_byfilter(userId, session=dbsession, **dbfilter)
+        for record in records:
+            try:
+                result = object_store_mgr.get_document(userId, 'policy_evaluations', record['evalId'])
+                record['result'] = result
+            except:
+                record['result'] = {}
 
     return records
 

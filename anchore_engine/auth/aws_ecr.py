@@ -3,13 +3,14 @@ import os
 import pytz
 import json
 import time
+import base64
 import boto3
 import datetime
 
-
+from anchore_engine import utils
 from anchore_engine.subsys import logger
 import anchore_engine.configuration.localconfig
-from urlparse import urlparse
+from urllib.parse import urlparse
 
 
 def parse_registry_url(registry_url):
@@ -29,7 +30,7 @@ def parse_registry_url(registry_url):
     """
     parsed = urlparse(registry_url)
     host = parsed.hostname if parsed.hostname is not None else parsed.path
-    (aid, dkr, ecr, region,azn,com) = host.split(".")
+    (aid, dkr, ecr, region, rest) = host.split(".", 4) # We only care about the prefix bits to extract account and region
     return aid, region
 
 def refresh_ecr_credentials(registry, access_key_id, secret_access_key):
@@ -53,7 +54,14 @@ def refresh_ecr_credentials(registry, access_key_id, secret_access_key):
         elif access_key_id == '_iam_role':
             try:
                 sts = boto3.client('sts')
-                session = sts.assume_role(RoleArn=secret_access_key, RoleSessionName=str(int(time.time())))
+                components = secret_access_key.split(';') # pass = "role_arn;external_id"
+                role_arn = components[0]
+                if len(components) > 1:
+                    external_id = components[1]
+                if external_id:
+                    session = sts.assume_role(RoleArn=role_arn, RoleSessionName=str(int(time.time())), ExternalId=external_id)
+                else:
+                    session = sts.assume_role(RoleArn=role_arn, RoleSessionName=str(int(time.time())))
                 access_key_id = session['Credentials']['AccessKeyId']
                 secret_access_key = session['Credentials']['SecretAccessKey']
                 session_token = session['Credentials']['SessionToken']
@@ -77,7 +85,7 @@ def refresh_ecr_credentials(registry, access_key_id, secret_access_key):
         raise err
 
     ret = {}
-    ret['authorizationToken'] = ecr_data['authorizationToken'].decode('base64')
+    ret['authorizationToken'] = utils.ensure_str(base64.decodebytes(utils.ensure_bytes(ecr_data['authorizationToken'])))
     ret['expiresAt'] = int(ecr_data['expiresAt'].strftime('%s'))
 
     return(ret)

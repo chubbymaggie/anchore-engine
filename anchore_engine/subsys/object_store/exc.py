@@ -1,10 +1,10 @@
 """
-Exception types for the archive drivers to normalize errors
+Exception types for the object storage drivers to normalize errors
 
 """
 
 
-class ObjectStorageDriverError(StandardError):
+class ObjectStorageDriverError(Exception):
     def __init__(self, cause=None):
         super(ObjectStorageDriverError, self).__init__()
         self.cause = cause
@@ -17,7 +17,7 @@ class DriverConfigurationError(ObjectStorageDriverError):
 
     def __init__(self, message=None, cause=None):
         super(DriverConfigurationError, self).__init__(cause)
-        self.message = message if message else 'Driver configuration error caused by: {}'.format(cause.message)
+        self.message = message if message else 'Driver configuration error caused by: {}'.format(cause.args[0] if cause.args else 'Unknown')
 
 
 class BadCredentialsError(DriverConfigurationError):
@@ -26,7 +26,7 @@ class BadCredentialsError(DriverConfigurationError):
         self.credentials = creds_dict
         self.endpoint = endpoint
         self.redacted_creds = {}
-        for key, val in self.credentials.items():
+        for key, val in list(self.credentials.items()):
             if val is not None:
                 if len(val) > 2:
                     self.redacted_creds[key] = val[:2] + ''.join(['*' for z in range(len(val) - 2)])
@@ -35,7 +35,7 @@ class BadCredentialsError(DriverConfigurationError):
             else:
                 self.redacted_creds[key] = val
 
-        self.message = 'Invalid credentials used: {} for endpoint {}. Details: {}'.format(self.redacted_creds, endpoint, cause.message)
+        self.message = 'Invalid credentials used: {} for endpoint {}. Details: {}'.format(self.redacted_creds, endpoint, cause.args[0] if cause.args else 'Unknown')
 
 
 class DriverBackendError(ObjectStorageDriverError):
@@ -70,10 +70,25 @@ class ObjectKeyNotFoundError(ObjectStorageDriverError):
         self.detail_message = msg
 
 
-class DriverNotInitializedError(StandardError):
+class DriverNotInitializedError(Exception):
     pass
 
 
-class DriverBackendNotAvailableError(StandardError):
+class DriverBackendNotAvailableError(Exception):
     pass
 
+
+class BucketNotFoundError(DriverConfigurationError):
+    def __init__(self, bucket):
+        self.bucket = bucket
+        self.message = 'Bucket {} not found in backing storage'.format(self.bucket)
+
+class ObjectNotFound(Exception):
+    def __init__(self, bucket, key):
+        super().__init__()
+        self.bucket = bucket
+        self.key = key
+        self.message = 'ObjectNotFound: {}/{}'.format(self.bucket, self.key)
+
+    def __str__(self):
+        return self.message

@@ -31,13 +31,13 @@ class NotLatestTrigger(BaseTrigger):
 
         feed_names = {p.name: p.latest for p in feed_npms}
 
-        for npm, versions in img_npms.items():
+        for npm, versions in list(img_npms.items()):
             if npm not in feed_names:
                 continue # Not an official
 
             for v in versions:
                 if v and v != feed_names.get(npm):
-                    self._fire("NPMNOTLATEST Package ("+npm+") version ("+v+") installed but is not the latest version ("+feed_names[npm]['latest']+")")
+                    self._fire(msg="NPMNOTLATEST Package ({}) version ({}) installed but is not the latest version ({})".format(npm, v, feed_names[npm]['latest']))
 
 
 class NotOfficialTrigger(BaseTrigger):
@@ -63,7 +63,7 @@ class NotOfficialTrigger(BaseTrigger):
 
         feed_names = {p.name: p.versions_json for p in feed_npms}
 
-        for npm in img_npms.keys():
+        for npm in list(img_npms.keys()):
             if npm not in feed_names:
                 self._fire(msg="NPMNOTOFFICIAL Package ("+str(npm)+") in container but not in official NPM feed.")
 
@@ -90,7 +90,7 @@ class BadVersionTrigger(BaseTrigger):
 
         feed_names = {p.name: p.versions_json for p in feed_npms}
 
-        for npm, versions in img_npms.items():
+        for npm, versions in list(img_npms.items()):
             if npm not in feed_names:
                 continue
 
@@ -113,7 +113,7 @@ class PkgMatchTrigger(BaseTrigger):
         :param context:
         :return:
         """
-        npms = image_obj.npms
+        npms = image_obj.get_packages_by_type('npm')
         if not npms:
             return
 
@@ -137,6 +137,7 @@ class PkgMatchTrigger(BaseTrigger):
 class NoFeedTrigger(BaseTrigger):
     __trigger_name__ = 'feed_data_unavailable'
     __description__ = 'Triggers if the engine does not have access to the NPM data feed.'
+    __msg__ = "NPM packages are present but the anchore npm feed is not available - will be unable to perform checks that require feed data"
 
     def evaluate(self, image_obj, context):
         try:
@@ -170,14 +171,21 @@ class NpmCheckGate(Gate):
             :return:
             """
 
-            if not image_obj.npms:
+            db_npms = image_obj.get_packages_by_type('npm')
+            if not db_npms:
                 return context
 
-            context.data[NPM_LISTING_KEY] = {p.name: p.versions_json for p in image_obj.npms}
+            #context.data[NPM_LISTING_KEY] = {p.name: p.versions_json for p in image_obj.npms}
+            npm_listing_key_data = {}
+            for p in db_npms:
+                if p.name not in npm_listing_key_data:
+                    npm_listing_key_data[p.name] = []
+                npm_listing_key_data[p.name].append(p.version)
+            context.data[NPM_LISTING_KEY] = npm_listing_key_data
 
-            npms = context.data[NPM_LISTING_KEY].keys()
+            npms = list(context.data[NPM_LISTING_KEY].keys())
             context.data[NPM_MATCH_KEY] = []
-            chunks = [npms[i: i+100] for i in xrange(0, len(npms), 100)]
+            chunks = [npms[i: i+100] for i in range(0, len(npms), 100)]
             for key_range in chunks:
                 context.data[NPM_MATCH_KEY] += context.db.query(NpmMetadata).filter(NpmMetadata.name.in_(key_range)).all()
 

@@ -1,10 +1,11 @@
 import functools
-import time
 
 import anchore_engine.configuration.localconfig
 from anchore_engine.subsys import logger
 from anchore_engine.version import version
+from anchore_engine.apis.authorization import auth_function_factory
 
+from flask.blueprints import Blueprint
 from prometheus_client import Histogram, Summary, Gauge, Counter
 from prometheus_flask_exporter import PrometheusMetrics
 
@@ -64,6 +65,9 @@ class disabled_flask_metrics(object):
     def histogram(self, *args, **kwargs):
         return self._call_nop()
 
+# Blueprint for wrapping the prometheus metrics
+metrics_blueprint = Blueprint('prometheus_metrics_blueprint', __name__)
+
 def init_flask_metrics(flask_app, export_defaults=True, **kwargs):
     global flask_metrics, enabled
 
@@ -80,9 +84,15 @@ def init_flask_metrics(flask_app, export_defaults=True, **kwargs):
     if not enabled:
         flask_metrics = disabled_flask_metrics()
         return(True)
-    
+
     if not flask_metrics:
-        flask_metrics = PrometheusMetrics(flask_app, export_defaults=export_defaults)
+        # Build a blueprint for metrics, wrapped in auth
+        flask_metrics = PrometheusMetrics(metrics_blueprint, export_defaults=export_defaults)
+
+        # Note: this must be after the addition of PrometheusMetrics to the blueprint in order to ensure proper ordering of before_request and after_request handling by prometheus counters
+        metrics_blueprint.before_request(auth_function_factory())
+        flask_app.register_blueprint(metrics_blueprint)
+
         flask_metrics.info('anchore_service_info', "Anchore Service Static Information", version=version, **kwargs)
 
     return(True)
@@ -106,7 +116,7 @@ def get_summary_obj(name, description="", **kwargs):
     ret = None
     try:
         if name not in metrics:
-            metrics[name] = Summary(name, description, kwargs.keys())
+            metrics[name] = Summary(name, description, list(kwargs.keys()))
         ret = metrics[name]
     except:
         logger.warn("could not create/get named metric ("+str(name)+")")
@@ -121,7 +131,7 @@ def summary_observe(name, observation, description="", **kwargs):
 
     try:
         if name not in metrics:
-            metrics[name] = Summary(name, description, kwargs.keys())
+            metrics[name] = Summary(name, description, list(kwargs.keys()))
 
         if kwargs:
             metrics[name].labels(**kwargs).observe(observation)
@@ -143,9 +153,9 @@ def histogram_observe(name, observation, description="", buckets=None, **kwargs)
         if name not in metrics:
             if buckets:
                 buckets.append(float("inf"))
-                metrics[name] = Histogram(name, description, kwargs.keys(), buckets=buckets)
+                metrics[name] = Histogram(name, description, list(kwargs.keys()), buckets=buckets)
             else:
-                metrics[name] = Histogram(name, description, kwargs.keys())
+                metrics[name] = Histogram(name, description, list(kwargs.keys()))
 
         if kwargs:
             metrics[name].labels(**kwargs).observe(observation)
@@ -164,7 +174,7 @@ def gauge_set(name, observation, description="", **kwargs):
 
     try:
         if name not in metrics:
-            metrics[name] = Gauge(name, description, kwargs.keys())
+            metrics[name] = Gauge(name, description, list(kwargs.keys()))
 
         if kwargs:
             metrics[name].labels(**kwargs).set(observation)
@@ -184,7 +194,7 @@ def counter_inc(name, step=1, description="", **kwargs):
 
     try:
         if name not in metrics:
-            metrics[name] = Counter(name, description, kwargs.keys())
+            metrics[name] = Counter(name, description, list(kwargs.keys()))
 
         if kwargs:
             metrics[name].labels(**kwargs).inc(step)

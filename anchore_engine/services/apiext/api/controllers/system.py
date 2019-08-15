@@ -4,11 +4,22 @@ import json
 import datetime
 
 # anchore modules
-from anchore_engine.clients import catalog, simplequeue, policy_engine
-import anchore_engine.services.common
+import anchore_engine.apis
+from anchore_engine.apis.authorization import get_authorizer, ActionBoundPermission
+
+import anchore_engine.common.helpers
+from anchore_engine.clients.services import internal_client_for
+from anchore_engine.clients.services.catalog import CatalogClient
+from anchore_engine.clients.services.policy_engine import PolicyEngineClient
+import anchore_engine.common
 import anchore_engine.subsys.servicestatus
 import anchore_engine.configuration.localconfig
-from anchore_engine.subsys import logger
+from anchore_engine.configuration.localconfig import GLOBAL_RESOURCE_DOMAIN
+from anchore_engine.apis.context import ApiRequestContextProxy
+from anchore_engine.common.errors import AnchoreError
+
+authorizer = get_authorizer()
+
 
 def make_response_service(user_auth, service_record, params):
     ret = {}
@@ -32,32 +43,33 @@ def make_response_service(user_auth, service_record, params):
 
     return (ret)
 
-def make_response_prune_candidate(user_auth, prune_record, params):
-    ret = {}
-    userId, pw = user_auth
-
-    try:
-        for k in ['reason', 'resourcetype', 'userId']:
-            ret[k] = prune_record[k]
-        ret['created_at'] = datetime.datetime.utcfromtimestamp(prune_record['created_at']).isoformat() + 'Z'
-
-        ret['resource_ids'] = {}
-        if 'resource_ids' in prune_record:
-            ret['resource_ids'] = copy.deepcopy(prune_record['resource_ids'])
-
-    except Exception as err:
-        raise Exception("failed to format prune response: " + str(err))
-
-    return (ret)
 
 def ping():
     """
     GET /
 
-    :return: 200 status with no content
+    :return: 200 status with api version string
     """
-    return
+    return ApiRequestContextProxy.get_service().__service_api_version__, 200
 
+
+def health_noop():
+    """
+    NOTE: not actually used. This is handled upstream by the twisted service wrapper
+    :return:
+    """
+    return '', 200
+
+
+def version_noop():
+    """
+    NOTE: not actually used. This is handled upstream by the twisted service wrapper
+    :return:
+    """
+    return '', 200
+
+
+@authorizer.requires([]) # Any authenticated user
 def get_status():
     """
     GET /status
@@ -65,21 +77,23 @@ def get_status():
     :return: service status object
     """
 
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={})
 
     return_object = {}
     httpcode = 500
 
     try:
-        localconfig = anchore_engine.configuration.localconfig.get_config()
-        return_object = anchore_engine.subsys.servicestatus.get_status({'hostid': localconfig['host_id'], 'servicename': 'apiext'})
+        service_record = anchore_engine.subsys.servicestatus.get_my_service_record()
+        return_object = anchore_engine.subsys.servicestatus.get_status(service_record)
         httpcode = 200
     except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return (return_object, httpcode)
 
+
+@authorizer.requires([])
 def get_service_detail():
     """
     GET /system/status
@@ -87,7 +101,7 @@ def get_service_detail():
     :return: list of service details
     """
 
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={})
     user_auth = request_inputs['auth']
     method = request_inputs['method']
     params = request_inputs['params']
@@ -101,7 +115,8 @@ def get_service_detail():
                 service_detail['service_states'] = []
                 try:
                     up_services = {}
-                    service_records = catalog.get_service(user_auth)
+                    client = internal_client_for(CatalogClient, request_inputs['userId'])
+                    service_records = client.get_service()
                     for service in service_records:
                         el = make_response_service(user_auth, service, params)
 
@@ -130,7 +145,7 @@ def get_service_detail():
                 httpcode = 200
 
             except Exception as err:
-                return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+                return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
                 httpcode = return_object['httpcode']
         except:
             service_detail = {}
@@ -142,6 +157,7 @@ def get_service_detail():
     return (return_object, httpcode)
 
 
+@authorizer.requires([ActionBoundPermission(domain=GLOBAL_RESOURCE_DOMAIN)])
 def list_services():
     """
     GET /system/services
@@ -149,25 +165,26 @@ def list_services():
     :param request_inputs:
     :return:
     """
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={})
     user_auth = request_inputs['auth']
     params = request_inputs['params']
 
     return_object = []
     httpcode = 500
     try:
-        service_records = catalog.get_service(user_auth)
+        client = internal_client_for(CatalogClient, request_inputs['userId'])
+        service_records = client.get_service()
         for service_record in service_records:
             return_object.append(make_response_service(user_auth, service_record, params))
 
         httpcode = 200
     except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return (return_object, httpcode)
 
-
+@authorizer.requires([ActionBoundPermission(domain=GLOBAL_RESOURCE_DOMAIN)])
 def get_services_by_name(servicename):
     """
     GET /system/services/<servicename>
@@ -177,25 +194,27 @@ def get_services_by_name(servicename):
     :param hostid:
     :return:
     """
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={})
     user_auth = request_inputs['auth']
     params = request_inputs['params']
 
     return_object = []
     httpcode = 500
     try:
-        service_records = catalog.get_service(user_auth, servicename=servicename)
+        client = CatalogClient(user=user_auth[0], password=user_auth[1])
+        service_records = client.get_service(servicename=servicename)
         for service_record in service_records:
             return_object.append(make_response_service(user_auth, service_record, params))
 
         httpcode = 200
     except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return (return_object, httpcode)
 
 
+@authorizer.requires([ActionBoundPermission(domain=GLOBAL_RESOURCE_DOMAIN)])
 def get_services_by_name_and_host(servicename, hostid):
     """
     GET /system/services/<servicename>/<hostid>
@@ -205,25 +224,27 @@ def get_services_by_name_and_host(servicename, hostid):
     :param hostid:
     :return:
     """
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={})
     user_auth = request_inputs['auth']
     params = request_inputs['params']
 
     return_object = []
     httpcode = 500
     try:
-        service_records = catalog.get_service(user_auth, servicename=servicename, hostid=hostid)
+        client = internal_client_for(CatalogClient, ApiRequestContextProxy.namespace())
+        service_records = client.get_service(servicename=servicename, hostid=hostid)
         for service_record in service_records:
             return_object.append(make_response_service(user_auth, service_record, params))
 
         httpcode = 200
     except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return (return_object, httpcode)
 
 
+@authorizer.requires([ActionBoundPermission(domain=GLOBAL_RESOURCE_DOMAIN)])
 def delete_service(servicename, hostid):
     """
     DELETE /system/services/<servicename>/<hostid>
@@ -232,131 +253,88 @@ def delete_service(servicename, hostid):
     :param hostid:
     :return:
     """
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={})
     user_auth = request_inputs['auth']
 
     return_object = []
     httpcode = 500
     try:
-        return_object = catalog.delete_service(user_auth, servicename=servicename, hostid=hostid)
+        client = internal_client_for(CatalogClient, request_inputs['userId'])
+        return_object = client.delete_service(servicename=servicename, hostid=hostid)
         if return_object:
             httpcode = 200
     except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return (return_object, httpcode)
 
+@authorizer.requires([])
 def get_system_feeds():
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
-    user_auth = request_inputs['auth']
-
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={})
     return_object = []
     httpcode = 500
     try:
-        p_client = policy_engine.get_client(user=user_auth[0], password=user_auth[1])
+        p_client = internal_client_for(PolicyEngineClient, userId=ApiRequestContextProxy.namespace())
         # do the p.e. feed get call
-        response = p_client.list_feeds(include_counts=True)
-        return_object = [x.to_dict() for x in response]
+        return_object = p_client.list_feeds(include_counts=True)
         if return_object:
             httpcode = 200
     except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return (return_object, httpcode)    
 
+@authorizer.requires([ActionBoundPermission(domain=GLOBAL_RESOURCE_DOMAIN)])
 def post_system_feeds(flush=False):
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={'flush': flush})
-    user_auth = request_inputs['auth']
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={'flush': flush})
 
     return_object = []
     httpcode = 500
     try:
-        p_client = policy_engine.get_client(user=user_auth[0], password=user_auth[1])
+        p_client = internal_client_for(PolicyEngineClient, userId=ApiRequestContextProxy.namespace())
         # do the p.e. feed post call
         return_object = p_client.sync_feeds(force_flush=flush)
-        if return_object:
+        if return_object is not None:
             httpcode = 200
     except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return (return_object, httpcode)    
 
-def get_system_prune_resourcetypes():
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
-    user_auth = request_inputs['auth']
-
-    return_object = []
-    httpcode = 500
-    try:
-        return_object = catalog.get_prune_resourcetypes(user_auth)
-        if return_object:
-            httpcode = 200
-    except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
-        httpcode = return_object['httpcode']
-
-    return (return_object, httpcode)
-
-def get_system_prune_candidates(resourcetype, dangling=True, olderthan=None):
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={'dangling': dangling, 'olderthan': olderthan})
-    user_auth = request_inputs['auth']
-    params = request_inputs['params']
-
-    return_object = {'prune_candidates': []}
-    httpcode = 500
-    try:
-        prune_candidates = catalog.get_prune_candidates(user_auth, resourcetype, dangling=params['dangling'], olderthan=params['olderthan'])
-        if prune_candidates:
-            for p in prune_candidates['prune_candidates']:
-                return_object['prune_candidates'].append(make_response_prune_candidate(user_auth, p, params))
-            httpcode = 200
-    except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
-        httpcode = return_object['httpcode']
-
-    return (return_object, httpcode)
-
-def post_system_prune_candidates(resourcetype, bodycontent):
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
-    user_auth = request_inputs['auth']
-
-    return_object = []
-    httpcode = 500
-    try:
-        return_object = catalog.perform_prune(user_auth, resourcetype, bodycontent)
-        if return_object:
-            httpcode = 200
-    except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
-        httpcode = return_object['httpcode']
-
-    return (return_object, httpcode)
-
+@authorizer.requires([])
 def describe_policy():
-    request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={})
-    user_auth = request_inputs['auth']
-
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={})
     return_object = []
     httpcode = 500
     try:
-        p_client = policy_engine.get_client(user=user_auth[0], password=user_auth[1])
+        p_client = internal_client_for(PolicyEngineClient, userId=ApiRequestContextProxy.namespace())
         return_object = p_client.describe_policy()
         if return_object:
             httpcode = 200
-        return_object = [x.to_dict() for x in return_object]
-
     except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
         httpcode = return_object['httpcode']
 
     return return_object, httpcode
 
+@authorizer.requires([])
+def describe_error_codes():
+    request_inputs = anchore_engine.apis.do_request_prep(request, default_params={})
+    return_object = []
+    httpcode = 500
+    try:
+        for e in AnchoreError:
+            el = {
+                'name': e.name,
+                'description': e.value,
+            }
+            return_object.append(el)
+        httpcode = 200
+    except Exception as err:
+        return_object = anchore_engine.common.helpers.make_response_error(err, in_httpcode=httpcode)
+        httpcode = return_object['httpcode']
 
-
-
-
-
-
+    return return_object, httpcode

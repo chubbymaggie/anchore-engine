@@ -1,19 +1,37 @@
 """
 Generic utilities
 """
+import datetime
 import hashlib
 import json
 import platform
 import subprocess
-import thread
 import uuid
-import tempfile
+import threading
 from collections import OrderedDict
-
+from contextlib import contextmanager
+from operator import itemgetter
+import time
 import os
 import re
 
 from anchore_engine.subsys import logger
+
+
+K_BYTES = 1024
+M_BYTES = 1024 * K_BYTES
+G_BYTES = 1024 * M_BYTES
+T_BYTES = 1024 * G_BYTES
+
+SIZE_UNITS = {
+    'kb': K_BYTES,
+    'mb': M_BYTES,
+    'gb': G_BYTES,
+    'tb': T_BYTES
+}
+
+BYTES_REGEX = re.compile('^([0-9]+)([kmgt]b)?$')
+
 
 def process_cve_status(old_cves_result=None, new_cves_result=None):
     """
@@ -55,15 +73,20 @@ def process_cve_status(old_cves_result=None, new_cves_result=None):
         "Severity",
         "Vulnerable_Package",
         "Fix_Available",
-        "URL"
+        "URL",
+        "Package_Name",
+        "Package_Version",
+        "Package_Type",
+        "Feed",
+        "Feed_Group",
     ]
 
     if new_cve_rows is None or old_cve_rows is None:
         return {}
 
-    new_cves = pivot_rows_to_keys(new_cve_header, new_cve_rows, key_name='CVE_ID',
+    new_cves = pivot_rows_to_keys(new_cve_header, new_cve_rows, key_names=['CVE_ID', 'Vulnerable_Package'],
                                   whitelist_headers=summary_elements)
-    old_cves = pivot_rows_to_keys(old_cve_header, old_cve_rows, key_name='CVE_ID',
+    old_cves = pivot_rows_to_keys(old_cve_header, old_cve_rows, key_names=['CVE_ID', 'Vulnerable_Package'],
                                   whitelist_headers=summary_elements)
     diff = item_diffs(old_cves, new_cves)
 
@@ -96,7 +119,7 @@ def item_diffs(old_items=None, new_items=None):
     added = [new_items[x] for x in new_ids.difference(old_ids)]
     removed = [old_items[x] for x in old_ids.difference(new_ids)]
     intersected_ids = new_ids.intersection(old_ids)
-    updated = [new_items[x] for x in filter(lambda x: new_items[x] != old_items[x], intersected_ids)]
+    updated = [new_items[x] for x in [x for x in intersected_ids if new_items[x] != old_items[x]]]
 
     return {
         'added': added,
@@ -129,7 +152,7 @@ def map_rows(header_list, row_list):
     return mapped
 
 
-def pivot_rows_to_keys(header_list, row_list, key_name, whitelist_headers=None):
+def pivot_rows_to_keys(header_list, row_list, key_names=[], whitelist_headers=None):
     """
     Slightly more direct converter for header,row combo into a dict of objects
 
@@ -139,9 +162,16 @@ def pivot_rows_to_keys(header_list, row_list, key_name, whitelist_headers=None):
     :return:
     """
     header_map = {v: header_list.index(v) for v in
-                  filter(lambda x: not whitelist_headers or x in whitelist_headers or x == key_name, header_list)}
-    key_idx = header_map[key_name]
-    return {x[key_idx]: {k: x[v] for k, v in header_map.items()} for x in row_list}
+                  [x for x in header_list if not whitelist_headers or x in whitelist_headers or x in key_names]}
+
+    key_idxs = []
+    for key_name in key_names:
+        key_idxs.append(header_map[key_name])
+
+    #key_idx = header_map[key_name]
+    #return {"{}{}".format(x[key_idx],x[keya_idx]): {k: x[v] for k, v in list(header_map.items())} for x in row_list}
+
+    return {":".join(itemgetter(*key_idxs)(x)): {k: x[v] for k, v in list(header_map.items())} for x in row_list}
 
 
 def filter_record_keys(record_list, whitelist_keys):
@@ -152,7 +182,7 @@ def filter_record_keys(record_list, whitelist_keys):
     :return: a new list with dicts that only contain the whitelisted elements
     """
 
-    filtered = map(lambda x: {k: v for k, v in filter(lambda y: y[0] in whitelist_keys, x.items())}, record_list)
+    filtered = [{k: v for k, v in [y for y in list(x.items()) if y[0] in whitelist_keys]} for x in record_list]
     return filtered
 
 def run_sanitize(cmd_list):
@@ -185,6 +215,9 @@ def run_command_list(cmd_list, env=None):
     except Exception as err:
         raise err
 
+    #sout = ensure_str(sout)
+    #serr = ensure_str(serr)
+
     return(rc, sout, serr)
 
 
@@ -193,24 +226,16 @@ def run_command(cmdstr, env=None):
 
 
 def manifest_to_digest(rawmanifest):
-    from anchore_engine.auth.skopeo_wrapper import manifest_to_digest_shellout
+    from anchore_engine.clients.skopeo_wrapper import manifest_to_digest_shellout
 
     ret = None
     d = json.loads(rawmanifest, object_pairs_hook=OrderedDict)
     if d['schemaVersion'] != 1:
-        d.pop('signatures', None)
-
-        # this is using regular json
-        dmanifest = re.sub(" +\n", "\n", json.dumps(d, indent=3))
-
-        # this if using simplejson
-        #dmanifest = json.dumps(d, indent=3)
-
-        ret = "sha256:" + str(hashlib.sha256(dmanifest).hexdigest())
+        ret = "sha256:" + str(hashlib.sha256(rawmanifest.encode('utf-8')).hexdigest())
     else:
-        #ret = anchore_engine.auth.skopeo_wrapper.manifest_to_digest_shellout(rawmanifest)
         ret = manifest_to_digest_shellout(rawmanifest)
-        
+
+    ret = ensure_str(ret)
     return(ret)
 
 
@@ -222,4 +247,545 @@ def get_threadbased_id(guarantee_uniq=False):
     :return: string
     """
 
-    return '{}:{}:{}:{}'.format(platform.node(), os.getpid(), str(thread.get_ident()), uuid.uuid4().hex if guarantee_uniq else '')
+    return '{}:{}:{}:{}'.format(platform.node(), os.getpid(), str(threading.get_ident()),uuid.uuid4().hex if guarantee_uniq else '')
+
+class AnchoreException(Exception):
+
+    def to_dict(self):
+        return {self.__class__.__name__: dict((key, value) for key, value in vars(self).items() if not key.startswith('_'))}
+
+def parse_dockerimage_string(instr):
+    host = None
+    port = None
+    repo = None
+    tag = None
+    registry = None
+    repotag = None
+    fulltag = None
+    fulldigest = None
+    digest = None
+    imageId = None
+
+    logger.debug("input string to parse: {}".format(instr))
+    instr = instr.strip()
+    bad_chars = re.findall(r"[^a-zA-Z0-9@:/_\.\-]", instr)
+    if bad_chars:
+        raise ValueError("bad character(s) {} in dockerimage string input ({})".format(bad_chars, instr))
+
+    if re.match("^sha256:.*", instr):
+        registry = 'docker.io'
+        digest = instr
+
+    elif len(instr) == 64 and not re.findall("[^0-9a-fA-F]+",instr):
+        imageId = instr
+    else:
+
+        # get the host/port
+        patt = re.match("(.*?)/(.*)", instr)
+        if patt:
+            a = patt.group(1)
+            remain = patt.group(2)
+            patt = re.match("(.*?):(.*)", a)
+            if patt:
+                host = patt.group(1)
+                port = patt.group(2)
+            elif a == 'docker.io':
+                host = 'docker.io'
+                port = None
+            elif a in ['localhost', 'localhost.localdomain', 'localbuild']:
+                host = a
+                port = None
+            else:
+                patt = re.match(r".*\..*", a)
+                if patt:
+                    host = a
+                else:
+                    host = 'docker.io'
+                    remain = instr
+                port = None
+
+        else:
+            host = 'docker.io'
+            port = None
+            remain = instr
+
+        # get the repo/tag
+        patt = re.match("(.*)@(.*)", remain)
+        if patt:
+            repo = patt.group(1)
+            digest = patt.group(2)
+        else:
+            patt = re.match("(.*):(.*)", remain)
+            if patt:
+                repo = patt.group(1)
+                tag = patt.group(2)
+            else:
+                repo = remain
+                tag = "latest"
+
+        if not tag:
+            tag = "latest"
+
+        if port:
+            registry = ':'.join([host, port])
+        else:
+            registry = host
+
+        if digest:
+            repotag = '@'.join([repo, digest])
+        else:
+            repotag = ':'.join([repo, tag])
+
+        fulltag = '/'.join([registry, repotag])
+
+        if not digest:
+            digest = None
+        else:
+            fulldigest = registry + '/' + repo + '@' + digest
+            tag = None
+            fulltag = None
+            repotag = None
+
+    ret = {}
+    ret['host'] = host
+    ret['port'] = port
+    ret['repo'] = repo
+    ret['tag'] = tag
+    ret['registry'] = registry
+    ret['repotag'] = repotag
+    ret['fulltag'] = fulltag
+    ret['digest'] = digest
+    ret['fulldigest'] = fulldigest
+    ret['imageId'] = imageId
+
+    if ret['fulldigest']:
+        ret['pullstring'] = ret['fulldigest']
+    elif ret['fulltag']:
+        ret['pullstring'] = ret['fulltag']
+    else:
+        ret['pullstring'] = None
+
+    return(ret)
+
+
+def ensure_bytes(obj):
+    return obj.encode('utf-8') if type(obj) != bytes else obj
+
+
+def ensure_str(obj):
+    return str(obj, 'utf-8') if type(obj) != str else obj
+
+
+rfc3339_date_fmt = '%Y-%m-%dT%H:%M:%SZ'
+rfc3339_date_input_fmts = ['%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%S:%fZ']
+
+def rfc3339str_to_epoch(rfc3339_str):
+    return int(rfc3339str_to_datetime(rfc3339_str).timestamp())
+
+def rfc3339str_to_datetime(rfc3339_str):
+    """
+    Convert the rfc3339 formatted string (UTC only) to a datatime object with tzinfo explicitly set to utc. Raises an exception if the parsing fails.
+
+    :param rfc3339_str:
+    :return:
+    """
+
+    ret = None
+    for fmt in rfc3339_date_input_fmts:
+        try:
+            ret = datetime.datetime.strptime(rfc3339_str, fmt)
+            # Force this since the formats we support are all utc formats, to support non-utc
+            if ret.tzinfo is None:
+                ret = ret.replace(tzinfo=datetime.timezone.utc)
+            continue
+        except:
+            pass
+
+    if ret is None:
+        raise Exception("could not convert input created_at value ({}) into datetime using formats in {}".format(rfc3339_str, rfc3339_date_input_fmts))
+
+    return(ret)
+
+def datetime_to_rfc3339(dt_obj):
+    """
+    Simple utility function. Expects a UTC input, does no tz conversion
+
+    :param dt_obj:
+    :return:
+    """
+
+    return dt_obj.strftime(rfc3339_date_fmt)
+
+
+def epoch_to_rfc3339(epoch_int):
+    """
+    Convert an epoch int value to a RFC3339 datetime string
+
+    :param epoch_int:
+    :return:
+    """
+    return datetime_to_rfc3339(datetime.datetime.utcfromtimestamp(epoch_int))
+
+
+def convert_bytes_size(size_str):
+    """
+    Converts a size string to an int. Allows trailing units
+
+    e.g. "10" -> 10, "1kb" -> 1024, "1gb" -> 1024*1024*1024
+    :param size_str:
+    :return:
+    """
+
+    m = BYTES_REGEX.fullmatch(size_str.lower())
+    if m:
+        number = int(m.group(1))
+
+        if m.group(2) is not None:
+            unit = m.group(2)
+            conversion = SIZE_UNITS.get(unit)
+            if conversion:
+                return conversion * number
+        return number
+    else:
+        raise ValueError("Invalid size string: {}".format(size_str))
+
+
+CPE_SPECIAL_CHAR_ENCODER = {
+    '!': '%21',
+    '"': '%22',
+    '#': '%23',
+    '$': '%24',
+    '%': '%25',
+    '&': '%26',
+    '\'': '%27',
+    '(': '%28',
+    ')': '%29',
+    '*': '%2a',
+    '+': '%2b',
+    ',': '%2c',
+    # '-': '-',  # not affected by transformation between formatted string and uri, only impacts wfn
+    # '.': '.',  # not affected by transformation between formatted string and uri, only impacts wfn
+    '/': '%2f',
+    ':': '%3a',
+    ';': '%3b',
+    '<': '%3c',
+    '=': '%3d',
+    '>': '%3e',
+    '?': '%3f',
+    '@': '%40',
+    '[': '%5b',
+    '\\': '%5c',
+    ']': '%5d',
+    '^': '%5e',
+    '`': '%60',
+    '{': '%7b',
+    '|': '%7c',
+    '}': '%7d',
+    '~': '%7e'
+}
+
+
+class CPE(object):
+    """
+    A helper class for converting CPE 2.3 formatted string into CPE 2.2 URI and matching CPE 2.3 formatted strings
+    """
+
+    def __init__(self, part=None, vendor=None, product=None, version=None, update=None, edition=None, language=None,
+                 sw_edition=None, target_sw=None, target_hw=None, other=None):
+        self.part = part
+        self.vendor = vendor
+        self.product = product
+        self.version = version
+        self.update = update
+        self.edition = edition
+        self.language = language
+        self.sw_edition = sw_edition
+        self.target_sw = target_sw
+        self.target_hw = target_hw
+        self.other = other
+
+    def __hash__(self):
+        return hash((self.part, self.vendor, self.product, self.version, self.update, self.edition, self.language,
+                     self.sw_edition, self.target_sw, self.target_hw, self.other))
+
+    def __eq__(self, other):
+        return other and self == other
+
+    def __repr__(self):
+        return 'CPE: part={}, vendor={}, product={}, version={}, update={}, edition={}, language={}, ' \
+               'sw_edition={}, target_sw={}, target_hw={}, other={}'.format(self.part, self.vendor, self.product,
+                                                                            self.version, self.update,
+                                                                            self.edition, self.language,
+                                                                            self.sw_edition, self.target_sw,
+                                                                            self.target_hw, self.other)
+
+    def copy(self):
+        return CPE(
+            part=self.part,
+            vendor=self.vendor,
+            product=self.product,
+            version=self.version,
+            update=self.update,
+            edition=self.edition,
+            language=self.language,
+            sw_edition=self.sw_edition,
+            target_sw=self.target_sw,
+            target_hw=self.target_hw,
+            other=self.other
+        )
+
+    @staticmethod
+    def from_cpe23_fs(cpe23_fs):
+        """
+        Takes a CPE 2.3 formatted string and returns a CPE object. This is the only supported method to create an instance of this class
+
+        This is not entirely true to the spec, it does not unbind all the elements as wfn representation is not used.
+        All of unbinding logic is concentrated in the conversion from wfn to uri format in as_cpe22_uri()
+
+        :param cpe23_fs: cpe:2.3:part:vendor:product:version:update:edition:language:sw_edition:target_sw:target_hw:other
+        :return:
+        """
+
+        cpe_parts = cpe23_fs.split(':')
+
+        if cpe_parts and len(cpe_parts) == 13:
+            return CPE(
+                part=cpe_parts[2],
+                vendor=cpe_parts[3],
+                product=cpe_parts[4],
+                version=cpe_parts[5],
+                update=cpe_parts[6],
+                edition=cpe_parts[7],
+                language=cpe_parts[8],
+                sw_edition=cpe_parts[9],
+                target_sw=cpe_parts[10],
+                target_hw=cpe_parts[11],
+                other=cpe_parts[12]
+            )
+        elif len(cpe_parts) > 13:
+            # logger.debug('{} did not split nicely into 13 parts'.format(cpe23_fs))
+
+            adjusted_cpe_parts = []
+            counter = 1
+
+            # start from the third element in the list and iterate through the penultimate element
+            while counter < len(cpe_parts) - 1:
+                counter += 1
+                part = cpe_parts[counter]
+
+                # if the element ends with a '\', good chance its an escape for ':', concatenate the elements together
+                if part.endswith('\\'):
+                    new_part = part
+
+                    while counter < len(cpe_parts) - 1:
+                        counter += 1
+                        part = cpe_parts[counter]
+                        new_part += ':' + part
+
+                        if part.endswith('\\'):
+                            continue
+                        else:
+                            break
+
+                    adjusted_cpe_parts.append(new_part)
+                else:
+                    adjusted_cpe_parts.append(part)
+
+            if len(adjusted_cpe_parts) == 11:
+                # logger.debug('Adjusted cpe components: {}'.format(adjusted_cpe_parts))
+                return CPE(
+                    part=adjusted_cpe_parts[0],
+                    vendor=adjusted_cpe_parts[1],
+                    product=adjusted_cpe_parts[2],
+                    version=adjusted_cpe_parts[3],
+                    update=adjusted_cpe_parts[4],
+                    edition=adjusted_cpe_parts[5],
+                    language=adjusted_cpe_parts[6],
+                    sw_edition=adjusted_cpe_parts[7],
+                    target_sw=adjusted_cpe_parts[8],
+                    target_hw=adjusted_cpe_parts[9],
+                    other=adjusted_cpe_parts[10]
+                )
+            else:
+                raise Exception('Cannot convert cpe 2.3 formatted string {} into wfn'.format(cpe23_fs))
+        else:
+            raise Exception(
+                'Invalid cpe 2.3 formatted string {} Splitting with : delimiter resulted in less than 13 elements'.format(
+                    cpe23_fs))
+
+    def as_cpe23_fs(self):
+        return 'cpe:2.3:{}'.format(':'.join([self.part,
+                                             self.vendor,
+                                             self.product,
+                                             self.version,
+                                             self.update,
+                                             self.edition,
+                                             self.language,
+                                             self.sw_edition,
+                                             self.target_sw,
+                                             self.target_hw,
+                                             self.other]))
+
+    def update_version(self, version):
+        """
+        Helper method for escaping the
+        Ensures that resulting version is CPE 2.3 formatted string compliant, this is necessary for as_cpe22_uri() to do its thing
+        affected version data in nvd json data which is usually unescaped. Converts the supplied version
+
+        :param version:
+        :return:
+        """
+        self.version = CPE.escape_for_cpe23_fs(version)
+
+    @staticmethod
+    def escape_for_cpe23_fs(element):
+        """
+        Helper method for escaping special characters as per the CPE 2.3 formatted string spec
+
+        :param element:
+        :return: escaped element string as per CPE 2.3 formatted string spec
+        """
+
+        if not isinstance(element, str):
+            raise Exception('Value to be escaped is not a string')
+
+        if element in ['*', '-', '']:  # let these pass through as they are
+            return element
+        elif any(char in CPE_SPECIAL_CHAR_ENCODER.keys() for char in element):
+            new_element = str()
+            pos = 0
+            while pos < len(element):
+                char = element[pos]
+
+                if char == '\\':  # this might be an escape character, check to see if the next character requires escape
+                    pos += 1
+                    if pos < len(element):
+                        n_char = element[pos]
+                        if n_char in CPE_SPECIAL_CHAR_ENCODER:  # definitely an escaped sequence, preserve it as it is
+                            new_element += char + n_char
+                        else:  # just a \ that needs to be escaped
+                            new_element += '\\' + char + n_char
+                    else:  # last char is unescaped \, just add an escape
+                        new_element += '\\' + char
+                elif char in CPE_SPECIAL_CHAR_ENCODER:
+                    new_element += '\\' + char
+                else:
+                    new_element += char
+
+                pos += 1
+
+            return new_element
+        else:
+            return element
+
+    @staticmethod
+    def bind_for_cpe22_uri(element):
+        if not isinstance(element, str):
+            raise Exception('Value to be bound in URI format is not a string')
+
+        if element == '*':
+            return ''
+        elif element in ['-', '']:
+            return element
+        else:
+            result = str()
+            pos = -1
+            while pos < (len(element) - 1):
+                pos += 1
+                char = element[pos]
+                if char == '\\':  # an escaped character, percent encode it if possible
+                    if pos != (len(element) - 1):  # check the next character and transform into percent encoded string
+                        pos += 1
+                        n_char = element[pos]
+                        encoded = CPE_SPECIAL_CHAR_ENCODER.get(n_char, None)
+                        if encoded:
+                            result += encoded
+                        else:  # no encoding found, let it go through as it is
+                            logger.warn('No encoding found for {}{}'.format(char, n_char))
+                            result += char + n_char
+                    else:  # this is the last char, nothing to percent encode
+                        logger.warn('{} is the last char, skipping percent encoded transformation'.format(char))
+                        result += char
+                elif char == '?':  # bind the unescaped ? to %01
+                    result += '%01'
+                elif char == '*':  # bind the unescaped * to %02
+                    result += '%02'
+                else:
+                    result += char
+
+            return result
+
+    def as_cpe22_uri(self):
+        """
+        Transforms this CPE object into a CPE 2.2 URI. Based on the specification in https://nvlpubs.nist.gov/nistpubs/Legacy/IR/nistir7695.pdf
+
+        :return: CPE 2.2 URI string
+        """
+
+        # part:vendor:product:version:update:edition:language:sw_edition:target_sw:target_hw:other
+        # 0    1      2       3       4      5       6        7          8         9         10
+        # |-------------cpe 2.2 attributes-----------        |------------new in cpe 2.3----------|
+
+        e = CPE.bind_for_cpe22_uri(self.edition)
+        sw_e = CPE.bind_for_cpe22_uri(self.sw_edition)
+        t_sw = CPE.bind_for_cpe22_uri(self.target_sw)
+        t_hw = CPE.bind_for_cpe22_uri(self.target_hw)
+        o = CPE.bind_for_cpe22_uri(self.other)
+
+        if sw_e or t_sw or t_hw or o:
+            edition = '~{}~{}~{}~{}~{}'.format(e, sw_e, t_sw, t_hw, o)
+        else:
+            edition = e
+
+        uri_parts = [
+            'cpe',
+            '/' + self.part,
+            CPE.bind_for_cpe22_uri(self.vendor),
+            CPE.bind_for_cpe22_uri(self.product),
+            CPE.bind_for_cpe22_uri(self.version),
+            CPE.bind_for_cpe22_uri(self.update),
+            edition,
+            CPE.bind_for_cpe22_uri(self.language),
+        ]
+
+        uri = ':'.join(uri_parts)
+        uri = uri.strip(':')  # remove any trailing :
+
+        return uri
+
+    def is_match(self, other_cpe):
+        """
+        This is a very limited implementation of cpe matching. other_cpe is a wildcard ridden base cpe used by range descriptors
+        other_cpe checked against this cpe for an exact match of part and vendor.
+        For all the remaining components a match is positive if the other cpe is an exact match or contains the wild char
+
+        :param other_cpe:
+        :return:
+        """
+        if not isinstance(other_cpe, CPE):
+            return False
+
+        if self.part == other_cpe.part and self.vendor == other_cpe.vendor:
+
+            if other_cpe.product not in ['*', self.product]:
+                return False
+            if other_cpe.version not in ['*', self.version]:
+                return False
+            if other_cpe.update not in ['*', self.update]:
+                return False
+            if other_cpe.edition not in ['*', self.edition]:
+                return False
+            if other_cpe.language not in ['*', self.language]:
+                return False
+            if other_cpe.sw_edition not in ['*', self.sw_edition]:
+                return False
+            if other_cpe.target_sw not in ['*', self.target_sw]:
+                return False
+            if other_cpe.target_hw not in ['*', self.target_hw]:
+                return False
+            if other_cpe.other not in ['*', self.other]:
+                return False
+
+            return True
+        else:
+            return False

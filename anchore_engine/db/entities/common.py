@@ -9,6 +9,7 @@ import traceback
 from contextlib import contextmanager
 
 import sqlalchemy
+from sqlalchemy import types
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
 import datetime
@@ -27,13 +28,14 @@ ThreadLocalSession = None  # Separate thread-local session maker
 engine = None
 Base = declarative_base()
 
+
 class UtilMixin(object):
     """
     Common mixin class for functions that all db entities (or most) should have
     """
 
     def update(self, inobj):
-        for a in inobj.keys():
+        for a in list(inobj.keys()):
             if hasattr(self, a):
                 setattr(self, a, inobj[a])
 
@@ -46,7 +48,7 @@ class UtilMixin(object):
 
         :return: string
         """
-        return dict((key, value if type(value) != datetime.datetime else value.isoformat()) for key, value in vars(self).iteritems() if not key.startswith('_'))
+        return dict((key, value if type(value) != datetime.datetime else value.isoformat()) for key, value in vars(self).items() if not key.startswith('_'))
 
     def to_dict(self):
         """
@@ -56,7 +58,7 @@ class UtilMixin(object):
         :return:
         """
 
-        return dict((key, value) for key, value in vars(self).iteritems() if not key.startswith('_'))
+        return dict((key, value) for key, value in vars(self).items() if not key.startswith('_'))
 
     def to_detached(self):
         """
@@ -66,7 +68,7 @@ class UtilMixin(object):
         """
 
         obj = self.__class__()
-        for name, attr in vars(self).iteritems():
+        for name, attr in vars(self).items():
             if not name.startswith('_'):
                 setattr(obj, name, attr)
 
@@ -81,13 +83,22 @@ def anchore_now():
     """
     return (int(time.time()))
 
+
+def anchore_now_datetime():
+    return datetime.datetime.utcnow()
+
+
+def anchore_uuid():
+    return uuid.uuid4().hex
+
+
 def get_entity_tables(entity):
     global Base
 
     import inspect
             
-    entity_names = [x[1].__tablename__ for x in filter(lambda x: inspect.isclass(x[1]) and issubclass(x[1], Base) and x[1] != Base, inspect.getmembers(entity))]
-    ftables = filter(lambda x: x.name in entity_names, Base.metadata.sorted_tables)
+    entity_names = [x[1].__tablename__ for x in [x for x in inspect.getmembers(entity) if inspect.isclass(x[1]) and issubclass(x[1], Base) and x[1] != Base]]
+    ftables = [x for x in Base.metadata.sorted_tables if x.name in entity_names]
 
     return(ftables)
 
@@ -115,17 +126,26 @@ def do_connect(db_params):
 
     db_connect = db_params.get('db_connect', None)
     db_connect_args = db_params.get('db_connect_args', None)
-    db_pool_size = db_params.get('db_pool_size', None)
-    db_pool_max_overflow = db_params.get('db_pool_max_overflow', None)
+    db_engine_args = db_params.get('db_engine_args', {})
+
+    # for bkwds compat
+    if db_params.get('db_pool_size', None):
+        db_engine_args['pool_size'] = db_params.get('db_pool_size', 30)
+    if db_params.get('db_pool_max_overflow', None):
+        db_engine_args['max_overflow'] = db_params.get('db_pool_max_overflow', 100)
+    if 'db_echo' in db_params:
+        db_engine_args['echo'] = db_params.get('db_echo', False)
 
     if db_connect:
         try:
             if db_connect.startswith('sqlite://'):
                 # Special case for testing with sqlite. Not for production use, unit tests only
-                engine = sqlalchemy.create_engine(db_connect, echo=False)
+                engine = sqlalchemy.create_engine(db_connect, echo=True)
             else:
-                engine = sqlalchemy.create_engine(db_connect, connect_args=db_connect_args, echo=False,
-                                                  pool_size=db_pool_size, max_overflow=db_pool_max_overflow)
+                logger.debug("db_connect_args {} db_engine_args={}".format(db_connect_args, db_engine_args))
+                #engine = sqlalchemy.create_engine(db_connect, connect_args=db_connect_args, echo=db_echo,
+                #                                  pool_size=db_pool_size, max_overflow=db_pool_max_overflow)
+                engine = sqlalchemy.create_engine(db_connect, connect_args=db_connect_args, **db_engine_args)
 
         except Exception as err:
             raise Exception("could not connect to DB - exception: " + str(err))
@@ -157,8 +177,10 @@ def get_params(localconfig):
         # connect to DB using db_connect from configuration
         db_connect = None
         db_connect_args = {}
-        db_pool_size = 10
-        db_pool_max_overflow = 20
+        db_pool_size = 30
+        db_pool_max_overflow = 75
+        db_echo = False
+
         if 'db_connect' in db_auth and db_auth['db_connect']:
             db_connect = db_auth['db_connect']
         if 'db_connect_args' in db_auth and db_auth['db_connect_args']:
@@ -167,38 +189,61 @@ def get_params(localconfig):
             db_pool_size = int(db_auth['db_pool_size'])
         if 'db_pool_max_overflow' in db_auth:
             db_pool_max_overflow = int(db_auth['db_pool_max_overflow'])
+        if 'db_echo' in db_auth:
+            db_echo = db_auth['db_echo'] in [True, 'True', 'true']
     except:
         raise Exception(
             "could not locate credentials->database entry from configuration: add 'database' section to 'credentials' section in configuration file")
 
-    ret = {
+    db_params = {
         'db_connect': db_connect,
         'db_connect_args': db_connect_args,
         'db_pool_size': db_pool_size,
-        'db_pool_max_overflow': db_pool_max_overflow
+        'db_pool_max_overflow': db_pool_max_overflow,
+        'db_echo': db_echo
     }
+    ret = normalize_db_params(db_params)
     return(ret)
 
-def do_create(specific_tables):
-    global engine, Base
+def normalize_db_params(db_params):
+    try:
+        db_connect = db_params['db_connect']
+    except:
+        raise Exception("input db_connect must be set")
 
+    db_connect_args = db_params.get('db_connect_args', {})
+
+    if '+pg8000' not in db_connect:
+        if 'timeout' in db_connect_args:
+            timeout = db_connect_args.pop('timeout')
+            db_connect_args['connect_timeout'] = int(timeout)
+        if 'ssl' in db_connect_args:
+            ssl = db_connect_args.pop('ssl')
+            if ssl:
+                db_connect_args['sslmode'] = 'require'
+            
+
+    return(db_params)
+        
+
+def do_create(specific_tables=None, base=Base):
+    engine = get_engine()
     try:
         if specific_tables:
             logger.info('Initializing only a subset of tables as requested: {}'.format(specific_tables))
-            Base.metadata.create_all(engine, tables=specific_tables)
+            base.metadata.create_all(engine, tables=specific_tables)
         else:
-            Base.metadata.create_all(engine)
+            base.metadata.create_all(engine)
     except Exception as err:
         raise Exception("could not create/re-create DB tables - exception: " + str(err))
 
 
 def initialize(localconfig=None, versions=None):
     """
-    Initialize the db for use. Optionally bootstrap it and optionally only for specific entities.
+    Initialize the db for use
 
+    :param localconfig: the global configuration
     :param versions:
-    :param bootstrap_db:
-    :param specific_entities: a list of entity classes to initialize if a subset is desired. Expects a list of classes.
     :return:
     """
     global engine, Session, SerializableSession
@@ -230,6 +275,11 @@ def initialize(localconfig=None, versions=None):
                 time.sleep(5)
 
     return (ret)
+
+
+def get_session():
+    global Session
+    return Session()
 
 @contextmanager
 def session_scope():
@@ -280,13 +330,31 @@ def end_session():
         ThreadLocalSession.remove()
 
 
-def init_thread_session():
+def init_thread_session(force_new=False):
     """
     Configure a scoped session factory which is a thread-local session cache
     :return:
     """
     global ThreadLocalSession, engine
-    if not ThreadLocalSession:
+    if force_new or not ThreadLocalSession:
         ThreadLocalSession = scoped_session(sessionmaker(bind=engine))
 
 
+class StringJSON(types.TypeDecorator):
+    """
+    A generic json text type for serialization and deserialization of json to text columns.
+    Note: will not detect modification of the content of the dict as an update. To update must change and re-assign the
+    value to the column rather than in-place updates.
+
+    """
+    impl = types.TEXT
+
+    def process_bind_param(self, value, dialect):
+        if value is not None:
+            value = json.dumps(value)
+            return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None:
+            value = json.loads(value)
+        return value

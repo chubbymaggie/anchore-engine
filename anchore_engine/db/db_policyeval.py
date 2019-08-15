@@ -50,7 +50,7 @@ def tsget_all(userId, imageDigest, tag, policyId=None, session=None):
 
     if results:
         for result in results:
-            obj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+            obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
             ret.append(obj)
 
     return(ret)
@@ -68,7 +68,7 @@ def tsget_all_bytag(userId, tag, policyId=None, session=None):
 
     if results:
         for result in results:
-            obj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+            obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
             ret.append(obj)
 
     return(ret)
@@ -96,7 +96,7 @@ def tsget_byfilter(userId, session=None, **dbfilter):
     results = session.query(PolicyEval).filter_by(**dbfilter).order_by(desc(PolicyEval.created_at))
     if results:
         for result in results:
-            obj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+            obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
             ret.append(obj)
 
     return(ret)
@@ -131,10 +131,58 @@ def get_all(session=None):
 
     our_results = session.query(PolicyEval)
     for result in our_results:
-        obj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+        obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
         ret.append(obj)
 
     return(ret)
+
+def get_all_byuserId(userId, limit=None, session=None):
+    if not session:
+        session = db.Session
+
+    ret = []
+
+    our_results = session.query(PolicyEval).filter_by(userId=userId)
+    if limit:
+        our_results = our_results.limit(int(limit))
+
+    for result in our_results:
+        obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
+        ret.append(obj)
+
+    return(ret)
+
+def get_all_bydigest(userId, imageDigest, session):
+    if not session:
+        session = db.Session
+
+    ret = []
+
+    our_results = session.query(PolicyEval).filter_by(userId=userId, imageDigest=imageDigest)
+
+    for result in our_results:
+        obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
+        ret.append(obj)
+
+    return(ret)
+
+def add_all_for_digest(records, session):
+    """
+    Assumes these are all valid records.
+
+    :param records: list of dicts from PolicyEval json dumps
+    :param session:
+    :return:
+    """
+
+    recs = []
+    for r in records:
+        rec = PolicyEval()
+        rec.update(r)
+        recs.append(session.add(rec))
+
+    return recs
+
 
 def get(userId, imageDigest, tag, policyId=None, session=None):
     if not session:
@@ -149,7 +197,7 @@ def get(userId, imageDigest, tag, policyId=None, session=None):
         result = session.query(PolicyEval).filter_by(userId=userId, imageDigest=imageDigest, tag=tag).order_by(desc(PolicyEval.created_at)).first()
 
     if result:
-        obj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+        obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
         ret = obj
 
     return(ret)

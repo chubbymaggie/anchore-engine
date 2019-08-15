@@ -35,20 +35,23 @@ def get_all(session=None):
 
     our_results = session.query(PolicyBundle)
     for result in our_results:
-        obj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+        obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
         ret.append(obj)
 
     return(ret)
 
-def get_all_byuserId(userId, session=None):
+def get_all_byuserId(userId, limit=None, session=None):
     if not session:
         session = db.Session
 
     ret = []
 
     our_results = session.query(PolicyBundle).filter_by(userId=userId)
+    if limit:
+        our_results = our_results.limit(int(limit))
+
     for result in our_results:
-        obj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+        obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
         ret.append(obj)
 
     return(ret)
@@ -64,7 +67,7 @@ def get_byfilter(userId, session=None, **dbfilter):
     results = session.query(PolicyBundle).filter_by(**dbfilter)
     if results:
         for result in results:
-            obj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+            obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
             ret.append(obj)
 
     return(ret)
@@ -77,7 +80,7 @@ def get(userId, policyId, session=None):
 
     result = session.query(PolicyBundle).filter_by(policyId=policyId).filter_by(userId=userId).first()
     if result:
-        obj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+        obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
         ret = obj
 
     return(ret)
@@ -90,7 +93,7 @@ def get_active_policy(userId, session=None):
 
     result = session.query(PolicyBundle).filter_by(userId=userId, active=True).first()
     if result:
-        obj = dict((key,value) for key, value in vars(result).iteritems() if not key.startswith('_'))
+        obj = dict((key,value) for key, value in vars(result).items() if not key.startswith('_'))
         ret = obj
 
     return(ret)

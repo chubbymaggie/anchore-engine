@@ -1,30 +1,54 @@
 import connexion
 
-from anchore_engine.services import common
+import anchore_engine.apis
+import anchore_engine.common.helpers
+from anchore_engine import common
 from anchore_engine.subsys import simplequeue, locking
 import anchore_engine.configuration.localconfig
 import anchore_engine.subsys.servicestatus
+from anchore_engine.subsys import logger
 import time
+from anchore_engine.apis.authorization import get_authorizer, INTERNAL_SERVICE_ALLOWED
 
 
+authorizer = get_authorizer()
+
+def normalize_errors(f):
+    def decorator(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except Exception as err:
+            logger.exception('API Error for {}'.format(f.__name__))
+            resp = anchore_engine.common.helpers.make_response_error(err, in_httpcode=500)
+            return resp, resp['httpcode']
+    return decorator
+
+@normalize_errors
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def status():
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    logger.info('Hitting status!')
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
 
     return_object = {}
     httpcode = 500
-    try:
-        localconfig = anchore_engine.configuration.localconfig.get_config()
-        return_object = anchore_engine.subsys.servicestatus.get_status({'hostid': localconfig['host_id'], 'servicename': 'simplequeue'})
-        httpcode = 200
-    except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
-        httpcode = return_object['httpcode']
 
-    return (return_object, httpcode)
+    #try:
 
+    service_record = anchore_engine.subsys.servicestatus.get_my_service_record()
+    return_object = anchore_engine.subsys.servicestatus.get_status(service_record)
+    httpcode = 200
 
+    # except Exception as err:
+    #     return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
+    #     httpcode = return_object['httpcode']
+
+    logger.info('Exiting: {} {}'.format(return_object, httpcode))
+    return return_object, httpcode
+
+@normalize_errors
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def is_inqueue(queuename, bodycontent):
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
     try:
         return_object = simplequeue.is_inqueue(queuename, bodycontent)
         httpcode = 200
@@ -35,8 +59,9 @@ def is_inqueue(queuename, bodycontent):
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def qlen(queuename):
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
     try:
         qlen = simplequeue.qlen(queuename)
         return_object = str(qlen)
@@ -48,8 +73,9 @@ def qlen(queuename):
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def enqueue(queuename, bodycontent, forcefirst=None, qcount=0):
-    request_inputs = common.do_request_prep(connexion.request, default_params={'forcefirst': forcefirst, 'qcount': qcount})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={'forcefirst': forcefirst, 'qcount': qcount})
     try:
         return_object = simplequeue.enqueue(queuename, bodycontent, qcount=qcount, forcefirst=forcefirst)
         httpcode = 200
@@ -60,8 +86,9 @@ def enqueue(queuename, bodycontent, forcefirst=None, qcount=0):
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def dequeue(queuename, wait_max_seconds=0, visibility_timeout=0):
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
 
     wait_expired = False
     wait_intervals = wait_max_seconds * 2
@@ -87,6 +114,7 @@ def dequeue(queuename, wait_max_seconds=0, visibility_timeout=0):
     return (return_object, 200)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def delete_message(queuename, receipt_handle):
     """
     Delete a message in given queue using the given receipt_handle, which must match the currently outstanding handle for the message.
@@ -95,7 +123,7 @@ def delete_message(queuename, receipt_handle):
     :param receipt_handle:
     :return:
     """
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
     return_object = None
     try:
         if simplequeue.delete_msg(queuename, receipt_handle):
@@ -109,6 +137,7 @@ def delete_message(queuename, receipt_handle):
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def update_message_visibility_timeout(queuename, receipt_handle, visibility_timeout):
     """
     Delete a message in given queue using the given receipt_handle, which must match the currently outstanding handle for the message.
@@ -117,7 +146,7 @@ def update_message_visibility_timeout(queuename, receipt_handle, visibility_time
     :param receipt_handle:
     :return:
     """
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
     try:
         result = simplequeue.update_visibility_timeout(queuename, receipt_handle, visibility_timeout)
         if result:
@@ -133,8 +162,9 @@ def update_message_visibility_timeout(queuename, receipt_handle, visibility_time
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def queues():
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
 
     try:
         return_object = simplequeue.get_queuenames()
@@ -146,8 +176,9 @@ def queues():
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def create_lease(lease_id):
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
 
     try:
         return_object = locking.manager().init_lease(lease_id)
@@ -159,8 +190,9 @@ def create_lease(lease_id):
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def list_leases():
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
 
     try:
         return_object = locking.manager().list()
@@ -172,8 +204,9 @@ def list_leases():
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def describe_lease(lease_id):
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
 
     try:
         return_object = locking.manager().get(lease_id)
@@ -185,8 +218,9 @@ def describe_lease(lease_id):
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def acquire_lease(lease_id, client_id, ttl):
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
 
     try:
         return_object = locking.manager().acquire_lease(lease_id, client_id, ttl)
@@ -198,8 +232,9 @@ def acquire_lease(lease_id, client_id, ttl):
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def release_lease(lease_id, client_id, epoch):
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
 
     try:
         return_object = locking.manager().release_lease(lease_id, client_id, epoch)
@@ -211,8 +246,9 @@ def release_lease(lease_id, client_id, epoch):
     return (return_object, httpcode)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def refresh_lease(lease_id, client_id, ttl, epoch):
-    request_inputs = common.do_request_prep(connexion.request, default_params={})
+    request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={})
 
     try:
         return_object = locking.manager().refresh(lease_id, client_id, epoch, ttl)

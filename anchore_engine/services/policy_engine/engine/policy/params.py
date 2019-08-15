@@ -1,8 +1,10 @@
 import re
 import jsonschema
+import json
 import copy
 
 from anchore_engine.services.policy_engine.engine.policy.exceptions import RequiredParameterNotSetError, ValidationError, ParameterValidationError
+from anchore_engine.subsys import logger
 
 
 class InputValidator(object):
@@ -50,6 +52,52 @@ class InputValidator(object):
             value = None
 
         return self.validate(value)
+
+
+class LinkedValidator(InputValidator):
+    __validator_type__ = "LinkedValidator"
+    __validator_description__ = "Validates a value based on the value of another parameter. If that parameter fails validation so will this one"
+
+    def __init__(self, discriminator_parameter, default_validator, value_map):
+        """
+        :param discriminator_parameter: The parameter definition that will determine the validator behavior (TriggerParameter type)
+        :param default_validator: The validator to use if the value_map does not contain the value of the discriminator parameter
+        :param value_map: dict mapping values of the discriminator parameter to InputValidators to use for this parameter value.
+        """
+        self.discriminator_name = discriminator_parameter
+        self.discriminator_value = None
+        self.mapper = value_map
+        self.default_validator = default_validator
+
+    def inject_discriminator(self, param):
+        self.discriminator_value = param
+
+    def validate(self, value):
+
+        try:
+            validator = self.mapper.get(self.discriminator_value)
+            if not validator:
+                validator = self.default_validator
+
+            logger.debug(
+                'Mapped discriminator param {} with value {} to validator {}'.format(self.discriminator_name, self.discriminator_value, validator))
+
+            return validator.validate(value)
+        except ValidationError:
+            raise
+        except Exception as e:
+            raise e
+
+    def validation_criteria(self):
+        """
+        Returns a json schema validation description
+        :return:
+        """
+        options = set([json.dumps(x.validation_criteria()) for x in self.mapper.values()] + [json.dumps(self.default_validator.validation_criteria())])
+
+        return {
+            'anyOf': [json.loads(x) for x in options]
+        }
 
 
 class JsonSchemaValidator(InputValidator):
@@ -105,7 +153,7 @@ class BooleanStringValidator(JsonSchemaValidator):
     }
 
     def validate(self, value):
-        value = unicode(value).lower() # handle any weird unicode chars
+        value = str(value).lower() # handle any weird unicode chars
         return super(BooleanStringValidator, self).validate(value)
 
 
@@ -137,13 +185,13 @@ class RegexParamValidator(JsonSchemaValidator):
         :param kwargs:
         :return:
         """
-        if type(value) not in [str, unicode]:
+        if type(value) not in [str, str]:
             return False
         return re.match(self.regex, value) is not None
 
 
 class DelimitedStringValidator(RegexParamValidator):
-    __regex__ = '^\s*(\s*({item})\s*{delim})*\s*({item}){mult}\s*$'
+    __regex__ = r'^\s*(\s*({item})\s*{delim})*\s*({item}){mult}\s*$'
     __validator_description__ = 'A string of character delimited values validated by a regex'
     __validator_type__ = 'DelimitedString'
     __item_regex__ = '.*'
@@ -168,7 +216,7 @@ class DelimitedStringValidator(RegexParamValidator):
 
 
 class CommaDelimitedNumberListValidator(DelimitedStringValidator):
-    __item_regex__ = '\d+'
+    __item_regex__ = r'\d+'
     __validator_type__ = 'CommaDelimitedStringOfNumbers'
     __validator_description__ = 'Comma delimited list of numbers'
 
@@ -176,28 +224,33 @@ class CommaDelimitedNumberListValidator(DelimitedStringValidator):
 class NameVersionListValidator(DelimitedStringValidator):
     __validator_description__ = 'Comma delimited list of name/version strings of format: name|version.'
     __validator_type__ = 'CommaDelimitedStringOfNameVersionPairs'
-    __item_regex__ = '[^|,]+\|[^|,]+'
+    __item_regex__ = r'[^|,]+\|[^|,]+'
     __delim__ = ','
 
 
 class CommaDelimitedStringListValidator(DelimitedStringValidator):
-    __item_regex__ = '[^,]+'
+    __item_regex__ = r'[^,]+'
     __delim__ = ','
     __validator_type__ = 'CommaDelimitedStringList'
     __validator_description__ = 'Comma delimited list of strings'
 
 
 class PipeDelimitedStringListValidator(DelimitedStringValidator):
-    __item_regex__ = '[^|]+'
-    __delim__ = '\|'
+    __item_regex__ = r'[^|]+'
+    __delim__ = r'\|'
     __validator_type__ = 'PipeDelimitedStringList'
     __validator_description__ = 'Pipe delimited list of strings'
 
 
 class IntegerValidator(RegexParamValidator):
-    __regex__ = '^\s*[\d]+\s*$'
+    __regex__ = r'^\s*[\d]+\s*$'
     __validator_type__ = 'IntegerString'
     __validator_description__ = 'Single integer number as a string'
+
+class FloatValidator(RegexParamValidator):
+    __regex__ = r'^\s*-*(\d)*(\.\d*)?\s*$'
+    __validator_type__ = 'FloatString'
+    __validator_description__ = 'Single float number as a string'
 
 
 class EnumValidator(JsonSchemaValidator):
@@ -219,7 +272,7 @@ class EnumValidator(JsonSchemaValidator):
 
 class DelimitedEnumStringValidator(RegexParamValidator):
     __enums__ = []
-    __regex__ = '^\s*(({enums})\s*{delim}\s*)*({enums})\s*$'
+    __regex__ = r'^\s*(({enums})\s*{delim}\s*)*({enums})\s*$'
     __validator_type__ = 'DelimitedEnumString'
 
     def __init__(self, enum_choices, delimiter=','):
@@ -472,3 +525,17 @@ class IntegerStringParameter(TriggerParameter):
         """
 
         return int(self._param_value) if self._param_value is not None else None
+
+
+class FloatStringParameter(TriggerParameter):
+    __validator__ = FloatValidator()
+
+    def _output_value(self):
+
+        """
+        Return a python float if set
+
+        :return: float or None
+        """
+
+        return float(self._param_value) if self._param_value is not None else None

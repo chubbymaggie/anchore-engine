@@ -7,24 +7,25 @@ import datetime
 import dateutil.parser
 import requests
 import time
-import urllib
+import urllib.request, urllib.parse, urllib.error
 
 
 from anchore_engine.db import get_thread_scoped_session as get_session, Image, end_session
 from anchore_engine.services.policy_engine.engine.logs import get_logger
 from anchore_engine.services.policy_engine.engine.loaders import ImageLoader
 from anchore_engine.services.policy_engine.engine.exc import *
-from anchore_engine.services.policy_engine.engine.vulnerabilities import vulnerabilities_for_image, find_vulnerable_image_packages, ImagePackageVulnerability, rescan_image, delete_matches
+from anchore_engine.services.policy_engine.engine.vulnerabilities import vulnerabilities_for_image, find_vulnerable_image_packages, ImagePackageVulnerability, rescan_image
 
-from anchore_engine.clients import catalog
+from anchore_engine.clients.services.catalog import CatalogClient
+from anchore_engine.clients.services import internal_client_for
 from anchore_engine.services.policy_engine.engine.feeds import DataFeeds, get_selected_feeds_to_sync
 from anchore_engine.configuration import localconfig
-from anchore_engine.services.common import get_system_user_auth
-from anchore_engine.clients.simplequeue import run_target_with_lease, LeaseAcquisitionFailedError
+from anchore_engine.clients.services.simplequeue import run_target_with_lease
+from anchore_engine.subsys.events import FeedSyncStart, FeedSyncComplete, FeedSyncFail
+from anchore_engine.subsys import identities
 
 # A hack to get admin credentials for executing api ops
-#from anchore_engine.services.catalog import db_users
-from anchore_engine.db import session_scope, db_users
+from anchore_engine.db import session_scope
 
 log = get_logger()
 
@@ -56,7 +57,7 @@ class AsyncTaskMeta(type):
             cls.tasks[dct['__task_name__']] = cls
 
 
-class IAsyncTask(object):
+class IAsyncTask(object, metaclass=AsyncTaskMeta):
     """
     Base type for async tasks to ensure they are in the task registry and implement the basic interface.
 
@@ -64,7 +65,6 @@ class IAsyncTask(object):
     complete control over the db session.
 
     """
-    __metaclass__ = AsyncTaskMeta
 
     __task_name__ = None
 
@@ -118,6 +118,7 @@ class FeedsFlushTask(IAsyncTask):
             log.exception('Error executing feeds flush task')
             raise
 
+
 class FeedsUpdateTask(IAsyncTask):
     """
     Scan and sync all configured and available feeds to ensure latest state.
@@ -135,8 +136,15 @@ class FeedsUpdateTask(IAsyncTask):
 
         :return:
         """
+        error = None
+        feeds = None
+
+        with session_scope() as session:
+            mgr = identities.manager_factory.for_session(session)
+            catalog_client = internal_client_for(CatalogClient, userId=None)
 
         try:
+
             feeds = get_selected_feeds_to_sync(localconfig.get_config())
             if json_obj:
                 task = cls.from_json(json_obj)
@@ -146,10 +154,15 @@ class FeedsUpdateTask(IAsyncTask):
             else:
                 task = FeedsUpdateTask(feeds_to_sync=feeds, flush=force_flush)
 
+            # Create feed task begin event
+            try:
+                catalog_client.add_event(FeedSyncStart(groups=feeds if feeds else 'all'))
+            except:
+                log.exception('Ignoring event generation error before feed sync')
+
             result = []
             if cls.locking_enabled:
-                system_user = get_system_user_auth()
-                run_target_with_lease(user_auth=system_user, lease_id='feed_sync', ttl=90, target=lambda: result.append(task.execute()))
+                run_target_with_lease(account=None, lease_id='feed_sync', ttl=90, target=lambda: result.append(task.execute()))
                 # A bit of work-around for the lambda def to get result from thread execution
                 if result:
                     result = result[0]
@@ -157,12 +170,19 @@ class FeedsUpdateTask(IAsyncTask):
                 result = task.execute()
 
             return result
-        except LeaseAcquisitionFailedError as ex:
-            log.exception('Could not acquire lock on feed sync, likely another sync already in progress')
-            raise Exception('Cannot execute feed sync, lock is held by another feed sync in progress')
         except Exception as e:
+            error = e
             log.exception('Error executing feeds update')
             raise e
+        finally:
+            # log feed sync event
+            try:
+                if error:
+                    catalog_client.add_event(FeedSyncFail(groups=feeds if feeds else 'all', error=error))
+                else:
+                    catalog_client.add_event(FeedSyncComplete(groups=feeds if feeds else 'all'))
+            except:
+                log.exception('Ignoring event generation error after feed sync')
 
     def __init__(self, feeds_to_sync=None, flush=False):
         self.feeds = feeds_to_sync
@@ -181,7 +201,6 @@ class FeedsUpdateTask(IAsyncTask):
         start_time = datetime.datetime.utcnow()
         try:
             f = DataFeeds.instance()
-            updated = []
             start_time = datetime.datetime.utcnow()
 
             f.vuln_fn = FeedsUpdateTask.process_updated_vulnerability
@@ -189,21 +208,20 @@ class FeedsUpdateTask(IAsyncTask):
 
             updated_dict = f.sync(to_sync=self.feeds, full_flush=self.full_flush)
 
-            # Response is dict with feed name and dict for each group mapped to list of images updated
-            log.info('Updated: {}'.format(updated_dict))
-            for feed in updated_dict:
-                for updated_imgs in updated_dict[feed].values():
-                    updated += updated_imgs
-
-            log.info('Feed sync complete')
-            return updated
+            log.info('Feed sync complete. Results = {}'.format(updated_dict))
+            return updated_dict
         except:
             log.exception('Failure refreshing and syncing feeds')
             raise
         finally:
             end_time = datetime.datetime.utcnow()
-            self.rescan_images_created_between(from_time=start_time, to_time=end_time)
-            end_session()
+            try:
+                self.rescan_images_created_between(from_time=start_time, to_time=end_time)
+            except:
+                log.exception('Unexpected exception rescanning vulns for images added during the feed sync')
+                raise
+            finally:
+                end_session()
 
     def rescan_images_created_between(self, from_time, to_time):
         """
@@ -227,10 +245,9 @@ class FeedsUpdateTask(IAsyncTask):
         try:
             # it is critical that these tuples are in proper index order for the primary key of the Images object so that subsequent get() operation works
             imgs = [(x.id, x.user_id) for x in db.query(Image).filter(Image.created_at >= from_time, Image.created_at <= to_time)]
-            log.info('Detected images: {} for rescan'.format(' ,'.join([str(x) for x in imgs])))
+            log.info('Detected images: {} for rescan'.format(' ,'.join([str(x) for x in imgs]) if imgs else '[]'))
         finally:
             db.rollback()
-
 
         retry_max = 3
         for img in imgs:
@@ -371,7 +388,7 @@ class ImageLoadTask(IAsyncTask):
 
     __loader_class__ = ImageLoader
 
-    def __init__(self, user_id, image_id, url=None, force_reload=False):
+    def __init__(self, user_id, image_id, url=None, force_reload=False, content_conn_timeout=None, content_read_timeout=None):
         self.image_id = image_id
         self.user_id = user_id
         self.start_time = None
@@ -381,6 +398,8 @@ class ImageLoadTask(IAsyncTask):
         self.received_at = None,
         self.created_at = datetime.datetime.utcnow()
         self.force_reload = force_reload
+        self.content_conn_timeout = content_conn_timeout
+        self.content_read_timeout = content_read_timeout
 
     def json(self):
         return {
@@ -438,12 +457,14 @@ class ImageLoadTask(IAsyncTask):
                 log.info("Adding image to db")
                 db.add(image_obj)
 
+                ts = time.time()
                 log.info("Adding image package vulnerabilities to db")
                 vulns = vulnerabilities_for_image(image_obj)
                 for vuln in vulns:
                     db.add(vuln)
 
                 db.commit()
+                #log.debug("TIMER TASKS: {}".format(time.time() - ts))
             except:
                 log.exception('Error adding image to db')
                 db.rollback()
@@ -499,23 +520,18 @@ class ImageLoadTask(IAsyncTask):
         :return: 
         """
 
-        split_url = urllib.splittype(url)
+        split_url = urllib.parse.splittype(url)
         if split_url[0] == 'file':
-            return self._get_file(split_url[1])
+            path = split_url[1][2:] # Strip the leading '//'
+            return self._get_file(path)
         elif split_url[0] == 'catalog':
             userId, bucket, name = split_url[1][2:].split('/')
 
             # Add auth if necessary
             try:
-                with session_scope() as dbsession:
-                    usr_record = db_users.get('admin', session=dbsession)
-                if not usr_record:
-                    raise Exception('User {} not found, cannot fetch analysis data'.format('admin'))
-            except:
-                log.exception('Cannot get admin credentials for fetching the analysis content to load')
-                raise
-            try:
-                doc = catalog.get_document((usr_record['userId'], usr_record['password']), bucket, name)
+                catalog_client = internal_client_for(CatalogClient, userId)
+                with catalog_client.timeout_context(self.content_conn_timeout, self.content_read_timeout) as timeout_client:
+                    doc = timeout_client.get_document(bucket, name)
                 return doc
             except:
                 log.exception('Error retrieving analysis json from the catalog service')

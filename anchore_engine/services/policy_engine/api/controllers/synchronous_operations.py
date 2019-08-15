@@ -4,21 +4,28 @@ Controller for all synchronous web operations. These are handled by the main web
 Async operations are handled by teh async_operations controller.
 
 """
-
+import connexion
+import datetime
+import enum
 import json
 import time
-
-import connexion
-from flask import abort, Response
+import hashlib
+import os
+import re
+from sqlalchemy import or_, and_, desc, asc, func
 from werkzeug.exceptions import HTTPException
 
+
 import anchore_engine.subsys.servicestatus
+from anchore_engine import utils, apis
+from anchore_engine.common.helpers import make_response_error
+
 from anchore_engine.services.policy_engine.api.models import Image as ImageMsg, PolicyValidationResponse
 
 from anchore_engine.services.policy_engine.api.models import ImageVulnerabilityListing, ImageIngressRequest, ImageIngressResponse, LegacyVulnerabilityReport, \
     GateSpec, TriggerParamSpec, TriggerSpec
 from anchore_engine.services.policy_engine.api.models import PolicyEvaluation, PolicyEvaluationProblem
-from anchore_engine.db import Image, ImageCpe, CpeVulnerability, get_thread_scoped_session as get_session
+from anchore_engine.db import Image, get_thread_scoped_session as get_session, ImagePackageVulnerability, ImageCpe, Vulnerability, ImagePackage, db_catalog_image, CachedPolicyEvaluation, select_nvd_classes, VulnDBMetadata, VulnDBCpe
 from anchore_engine.services.policy_engine.engine.policy.bundles import build_bundle, build_empty_error_execution
 from anchore_engine.services.policy_engine.engine.policy.exceptions import InitializationError
 from anchore_engine.services.policy_engine.engine.policy.gate import ExecutionContext, Gate
@@ -27,17 +34,30 @@ from anchore_engine.services.policy_engine.engine.vulnerabilities import have_vu
 from anchore_engine.services.policy_engine.engine.vulnerabilities import rescan_image
 from anchore_engine.db import DistroNamespace
 from anchore_engine.subsys import logger as log
+from anchore_engine.apis.authorization import get_authorizer, INTERNAL_SERVICE_ALLOWED
+from anchore_engine.services.policy_engine.engine.feeds import DataFeeds
+from anchore_engine.clients.services import internal_client_for, catalog
+from anchore_engine.apis.context import ApiRequestContextProxy
+from anchore_engine.clients.services.common import get_service_endpoint
+
+authorizer = get_authorizer()
 
 # Leave this here to ensure gates registry is fully loaded
-import anchore_engine.subsys.metrics
+from anchore_engine.subsys import metrics
 from anchore_engine.subsys.metrics import flask_metrics
 
-TABLE_STYLE_HEADER_LIST = ['CVE_ID', 'Severity', '*Total_Affected', 'Vulnerable_Package', 'Fix_Available', 'Fix_Images', 'Rebuild_Images', 'URL', 'Package_Type', 'Feed', 'Feed_Group', 'Package_Name', 'Package_Version']
+TABLE_STYLE_HEADER_LIST = ['CVE_ID', 'Severity', '*Total_Affected', 'Vulnerable_Package', 'Fix_Available', 'Fix_Images', 'Rebuild_Images', 'URL', 'Package_Type', 'Feed', 'Feed_Group', 'Package_Name', 'Package_Version', 'CVES']
+
+DEFAULT_CACHE_CONN_TIMEOUT = -1 # Disabled by default, can be set in config file. Seconds for connection to cache for policy evals
+DEFAULT_CACHE_READ_TIMEOUT = -1 # Disabled by default, can be set in config file. Seconds for first byte timeout for policy eval cache
 
 # Toggle of lock usage, primarily for testing and debugging usage
 feed_sync_locking_enabled = True
 
+evaluation_cache_enabled = (os.getenv('ANCHORE_POLICY_ENGINE_EVALUATION_CACHE_ENABLED', 'true').lower() == 'true')
 
+
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def get_status():
     """
     Generic status return common to all services
@@ -45,13 +65,8 @@ def get_status():
     """
     httpcode = 500
     try:
-        localconfig = anchore_engine.configuration.localconfig.get_config()
-        return_object = anchore_engine.subsys.servicestatus.get_status({'hostid': localconfig['host_id'], 'servicename': 'policy_engine'})
-        #return_object = {
-        #    'busy': False,
-        #    'up': True,
-        #    'message': 'all good'
-        #}
+        service_record = anchore_engine.subsys.servicestatus.get_my_service_record()
+        return_object = anchore_engine.subsys.servicestatus.get_status(service_record)
         httpcode = 200
     except Exception as err:
         return_object = str(err)
@@ -63,12 +78,12 @@ class ImageMessageMapper(object):
     """
     Map the msg to db and vice-versa
     """
-    rfc2339_date_fmt = '%Y-%m-%dT%H:%M:%SZ'
+    rfc3339_date_fmt = '%Y-%m-%dT%H:%M:%SZ'
 
     def db_to_msg(self, db_obj):
         msg = ImageMsg()
-        msg.last_modified = db_obj.last_modified.strftime(self.rfc2339_date_fmt)
-        msg.created_at = db_obj.created_at.strftime(self.rfc2339_date_fmt)
+        msg.last_modified = db_obj.last_modified.strftime(self.rfc3339_date_fmt)
+        msg.created_at = db_obj.created_at.strftime(self.rfc3339_date_fmt)
         msg.distro_namespace = db_obj.distro_namespace
         msg.user_id = db_obj.user_id
         msg.state = db_obj.state
@@ -86,9 +101,27 @@ class ImageMessageMapper(object):
         db_obj.last_modified = msg.last_modified
         return db_obj
 
+
 msg_mapper = ImageMessageMapper()
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
+def get_cache_status():
+    return {"enabled": evaluation_cache_enabled}, 200
+
+
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
+def set_cache_status(status):
+    global evaluation_cache_enabled
+
+    if status.get('enabled') is not None and type(status.get('enabled')) == bool:
+        evaluation_cache_enabled = status.get('enabled')
+        return {"enabled": evaluation_cache_enabled}, 200
+    else:
+        return make_response_error(errmsg='Invalid request', in_httpcode=400), 400
+
+
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def list_image_users(page=None):
     """
     Returns the list of users the system knows about, based on images from users.
@@ -108,6 +141,7 @@ def list_image_users(page=None):
     return list(img_user_set)
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def list_user_images(user_id):
     """
     Given a user_id, returns a list of Image objects scoped to that user.
@@ -124,6 +158,7 @@ def list_user_images(user_id):
     return imgs
 
 @flask_metrics.do_not_track()
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def delete_image(user_id, image_id):
     """
     DELETE the image and all resources for it. Returns 204 - No Content on success
@@ -139,6 +174,16 @@ def delete_image(user_id, image_id):
         if img:
             for pkg_vuln in img.vulnerabilities():
                 db.delete(pkg_vuln)
+            #for pkg_vuln in img.java_vulnerabilities():
+            #    db.delete(pkg_vuln)
+            try:
+                conn_timeout = ApiRequestContextProxy.get_service().configuration.get('catalog_client_conn_timeout', DEFAULT_CACHE_CONN_TIMEOUT)
+                read_timeout = ApiRequestContextProxy.get_service().configuration.get('catalog_client_read_timeout', DEFAULT_CACHE_READ_TIMEOUT)
+                mgr = EvaluationCacheManager(img, None, None, conn_timeout, read_timeout)
+                mgr.flush()
+            except Exception as ex:
+                log.exception("Could not delete evaluations for image {}/{} in the cache. May be orphaned".format(user_id, image_id))
+
             db.delete(img)
             db.commit()
         else:
@@ -148,10 +193,10 @@ def delete_image(user_id, image_id):
         return (None, 204)
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
         log.exception('Error processing DELETE request for image {}/{}'.format(user_id, image_id))
         db.rollback()
-        abort(500)
+        return make_response_error('Error deleting image {}/{}: {}'.format(user_id, image_id, e), in_httpcode=500), 500
 
 
 def problem_from_exception(eval_exception, severity=None):
@@ -182,7 +227,191 @@ def problem_from_exception(eval_exception, severity=None):
     return prob
 
 
+# Global cache for policy evaluations
+class EvaluationCacheManager(object):
+
+    class CacheStatus(enum.Enum):
+        valid = 'valid'  # The cached entry is a valid result
+        stale = 'stale'  # The entry is stale because a feed sync has occurred since last evaluation
+        invalid = 'invalid'  # The entry is invalid because the bundle digest has changed
+        missing = 'missing'  # No entry
+
+    __cache_bucket__ = 'policy-engine-evaluation-cache'
+
+    def __init__(self, image_object, tag, bundle, storage_conn_timeout=-1, storage_read_timeout=-1):
+        self.image = image_object
+        self.tag = tag
+        if bundle:
+            self.bundle = bundle
+            self.bundle_id = None
+
+            if bundle.get('id') is None:
+                raise ValueError('Invalid bundle format')
+            else:
+                self.bundle_id = bundle['id']
+
+            self.bundle_digest = self._digest_for_bundle()
+        else:
+            self.bundle = None
+            self.bundle_id = None
+            self.bundle_digest = None
+
+        self._catalog_client = internal_client_for(catalog.CatalogClient, userId=self.image.user_id)
+        self._default_catalog_conn_timeout = storage_conn_timeout
+        self._default_catalog_read_timeout = storage_read_timeout
+
+    def _digest_for_bundle(self):
+        return hashlib.sha256(utils.ensure_bytes(json.dumps(self.bundle, sort_keys=True))).hexdigest()
+
+    def refresh(self):
+        """
+        Refreshes the cache state (not entry) for this initialized request.
+
+        Has stateful side-effects of flushing objects from cache if determined to be invalid
+
+        If a valid entry exists, it is loaded, if an invalid entry exists it is deleted
+
+        :return:
+        """
+        session = get_session()
+        match = None
+        for result in self._lookup():
+            if self._should_evaluate(result) != EvaluationCacheManager.CacheStatus.valid:
+                self._delete_entry(result)
+            else:
+                match = result
+
+        session.flush()
+
+        if match:
+            if match.is_archive_ref():
+                bucket, key = match.archive_tuple()
+                try:
+                    with self._catalog_client.timeout_context(self._default_catalog_conn_timeout, self._default_catalog_read_timeout) as timeout_client:
+                        data = timeout_client.get_document(bucket, key)
+                except:
+                    log.exception('Unexpected error getting document {}/{} from archive'.format(bucket, key))
+                    data = None
+            else:
+                data = match.result.get('result')
+        else:
+            data = None
+
+        return data
+
+    def _delete_entry(self, entry):
+        session = get_session()
+
+        if entry.is_archive_ref():
+            bucket, key = entry.archive_tuple()
+            retry = 3
+            while retry > 0:
+                try:
+                    with self._catalog_client.timeout_context(self._default_catalog_conn_timeout, self._default_catalog_read_timeout) as timeout_client:
+                        resp = timeout_client.delete_document(bucket, key)
+                    break
+                except:
+                    log.exception('Could not delete policy eval from cache, will retry. Bucket={}, Key={}'.format(bucket, key))
+                    retry -= 1
+            else:
+                log.error('Could not flush policy eval from cache after all retries, may be orphaned. Will remove from index.')
+
+        session.delete(entry)
+        session.flush()
+
+    def _lookup(self):
+        """
+        Returns all entries for the bundle,
+        :param user_id:
+        :param image_id:
+        :param tag:
+        :param bundle_id:
+        :return:
+        """
+
+        session = get_session()
+        return session.query(CachedPolicyEvaluation).filter_by(user_id=self.image.user_id, image_id=self.image.id, eval_tag=self.tag, bundle_id=self.bundle_id).all()
+
+    def save(self, result):
+        """
+        Persist the new result for this cache entry
+        :param result:
+        :return:
+        """
+        eval = CachedPolicyEvaluation()
+        eval.user_id = self.image.user_id
+        eval.image_id = self.image.id
+        eval.bundle_id = self.bundle_id
+        eval.bundle_digest = self.bundle_digest
+        eval.eval_tag = self.tag
+
+        # Send to archive
+        key = 'sha256:' + hashlib.sha256(utils.ensure_bytes(str(eval.key_tuple()))).hexdigest()
+        with self._catalog_client.timeout_context(self._default_catalog_conn_timeout, self._default_catalog_read_timeout) as timeout_client:
+            resp = timeout_client.put_document(self.__cache_bucket__, key, result)
+
+        if not resp:
+            raise Exception('Failed cache write to archive store')
+
+        str_result = json.dumps(result, sort_keys=True)
+        result_digest = 'sha256:' + hashlib.sha256(utils.ensure_bytes(str_result)).hexdigest()
+
+        eval.add_remote_result(self.__cache_bucket__, key, result_digest)
+        eval.last_modified = datetime.datetime.utcnow()
+
+        # Update index
+        session = get_session()
+        return session.merge(eval)
+
+    def _inputs_changed(self, cache_timestamp):
+        # A feed sync has occurred since the eval was done or the image has been updated/reloaded, so inputs can have changed. Must be stale
+        feed_group_updated_list = [group.last_sync if group.last_sync is not None else datetime.datetime.utcfromtimestamp(0) for feed in DataFeeds.instance().list_metadata() for group in feed.groups]
+        feed_synced = max(feed_group_updated_list) > cache_timestamp if feed_group_updated_list else False
+
+        image_updated = self.image.last_modified > cache_timestamp
+
+        return feed_synced or image_updated
+
+    def _should_evaluate(self, cache_entry: CachedPolicyEvaluation):
+        if cache_entry is None:
+            metrics.counter_inc(name='anchore_policy_evaluation_cache_misses_notfound')
+            return EvaluationCacheManager.CacheStatus.missing
+
+        # The cached result is not for this exact bundle content, so result is invalid
+        if cache_entry.bundle_id != self.bundle_id:
+            log.warn("Unexpectedly got a cached evaluation for a different bundle id")
+            metrics.counter_inc(name='anchore_policy_evaluation_cache_misses_notfound')
+            return EvaluationCacheManager.CacheStatus.missing
+
+        if cache_entry.bundle_digest == self.bundle_digest:
+            # A feed sync has occurred since the eval was done or the image has been updated/reloaded, so inputs can have changed. Must be stale
+            if self._inputs_changed(cache_entry.last_modified):
+                metrics.counter_inc(name='anchore_policy_evaluation_cache_misses_stale')
+                return EvaluationCacheManager.CacheStatus.stale
+            else:
+                return EvaluationCacheManager.CacheStatus.valid
+        else:
+            metrics.counter_inc(name='anchore_policy_evaluation_cache_misses_invalid')
+            return EvaluationCacheManager.CacheStatus.invalid
+
+    def flush(self):
+        """
+        Flush all cache entries for the given image
+        :return:
+        """
+        session = get_session()
+        for entry in session.query(CachedPolicyEvaluation).filter_by(user_id=self.image.user_id, image_id=self.image.id):
+            try:
+                self._delete_entry(entry)
+
+            except:
+                log.exception('Could not delete eval cache entry: {}'.format(entry))
+
+        return True
+
+
 @flask_metrics.do_not_track()
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def check_user_image_inline(user_id, image_id, tag, bundle):
     """
     Execute a policy evaluation using the info in the request body including the bundle content
@@ -196,6 +425,8 @@ def check_user_image_inline(user_id, image_id, tag, bundle):
 
     timer = time.time()
     db = get_session()
+    cache_mgr = None
+
     try:
         # Input validation
         if tag is None:
@@ -205,11 +436,44 @@ def check_user_image_inline(user_id, image_id, tag, bundle):
         try:
             img_obj = db.query(Image).get((image_id, user_id))
         except:
-            abort(Response(response='Image not found', status=404))
+            return make_response_error('Image not found', in_httpcode=404), 404
 
         if not img_obj:
             log.info('Request for evaluation of image that cannot be found: user_id = {}, image_id = {}'.format(user_id, image_id))
-            abort(Response(response='Image not found', status=404))
+            return make_response_error('Image not found', in_httpcode=404), 404
+
+        if evaluation_cache_enabled:
+            timer2 = time.time()
+            try:
+                try:
+                    conn_timeout = ApiRequestContextProxy.get_service().configuration.get('catalog_client_conn_timeout', DEFAULT_CACHE_CONN_TIMEOUT)
+                    read_timeout = ApiRequestContextProxy.get_service().configuration.get('catalog_client_read_timeout', DEFAULT_CACHE_READ_TIMEOUT)
+                    cache_mgr = EvaluationCacheManager(img_obj, tag, bundle, conn_timeout, read_timeout)
+                except ValueError as err:
+                    log.warn('Could not leverage cache due to error in bundle data: {}'.format(err))
+                    cache_mgr = None
+
+                if cache_mgr is None:
+                    log.info('Could not initialize cache manager for policy evaluation, skipping cache usage')
+                else:
+                    cached_result = cache_mgr.refresh()
+                    if cached_result:
+                        metrics.counter_inc(name='anchore_policy_evaluation_cache_hits')
+                        metrics.histogram_observe('anchore_policy_evaluation_cache_access_latency', time.time() - timer2,
+                                                  status="hit")
+                        log.info('Returning cached result of policy evaluation for {}/{}, with tag {} and bundle {} with digest {}. Last evaluation: {}'.format(user_id, image_id, tag, cache_mgr.bundle_id, cache_mgr.bundle_digest, cached_result.get('last_modified')))
+                        return cached_result
+                    else:
+                        metrics.counter_inc(name='anchore_policy_evaluation_cache_misses')
+                        metrics.histogram_observe('anchore_policy_evaluation_cache_access_latency', time.time() - timer2,
+                                                  status="miss")
+                        log.info('Policy evaluation not cached, or invalid, executing evaluation for {}/{} with tag {} and bundle {} with digest {}'.format(user_id, image_id, tag, cache_mgr.bundle_id, cache_mgr.bundle_digest))
+
+            except Exception as ex:
+                log.exception('Unexpected error operating on policy evaluation cache. Skipping use of cache.')
+
+        else:
+            log.info('Policy evaluation cache disabled. Executing evaluation')
 
         # Build bundle exec.
         problems = []
@@ -229,8 +493,8 @@ def check_user_image_inline(user_id, image_id, tag, bundle):
             try:
                 eval_result = executable_bundle.execute(img_obj, tag, ExecutionContext(db_session=db, configuration={}))
             except Exception as e:
-                log.exception('Error executing policy bundle {} against image {} w/tag {}: {}'.format(bundle['id'], image_id, tag, e.message))
-                abort(Response(response='Cannot execute given policy against the image due to errors executing the policy bundle: {}'.format(e.message), status=500))
+                log.exception('Error executing policy bundle {} against image {} w/tag {}: {}'.format(bundle['id'], image_id, tag, e))
+                return make_response_error('Internal bundle evaluation error', details={'message':'Cannot execute given policy against the image due to errors executing the policy bundle: {}'.format(e)}, in_httpcode=500), 500
         else:
             # Construct a failure eval with details on the errors and mappings to send to client
             eval_result = build_empty_error_execution(img_obj, tag, executable_bundle, errors=problems, warnings=[])
@@ -255,11 +519,22 @@ def check_user_image_inline(user_id, image_id, tag, bundle):
         if resp.evaluation_problems:
             for i in resp.evaluation_problems:
                 log.warn('Returning evaluation response for image {}/{} w/tag {} and bundle {} that contains error: {}'.format(user_id, image_id, tag, bundle['id'], json.dumps(i.to_dict())))
-            anchore_engine.subsys.metrics.histogram_observe('anchore_policy_evaluation_time_seconds', time.time() - timer, status="fail")
+            metrics.histogram_observe('anchore_policy_evaluation_time_seconds', time.time() - timer, status="fail")
         else:
-            anchore_engine.subsys.metrics.histogram_observe('anchore_policy_evaluation_time_seconds', time.time() - timer, status="success")
+            metrics.histogram_observe('anchore_policy_evaluation_time_seconds', time.time() - timer, status="success")
 
-        return resp.to_dict()
+        result = resp.to_dict()
+
+        # Never let the cache block returning results
+        try:
+            if evaluation_cache_enabled and cache_mgr is not None:
+                cache_mgr.save(result)
+        except Exception as ex:
+            log.exception("Failed saving policy result in cache. Skipping and continuing.")
+
+        db.commit()
+
+        return result
 
     except HTTPException as e:
         db.rollback()
@@ -268,12 +543,13 @@ def check_user_image_inline(user_id, image_id, tag, bundle):
     except Exception as e:
         db.rollback()
         log.exception('Failed processing bundle evaluation: {}'.format(e))
-        abort(Response('Unexpected internal error', 500))
+        return make_response_error('Unexpected internal error', details={'message': str(e)}, in_httpcode=500), 500
     finally:
         db.close()
 
 
 @flask_metrics.do_not_track()
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def get_image_vulnerabilities(user_id, image_id, force_refresh=False, vendor_only=True):
     """
     Return the vulnerability listing for the specified image and load from catalog if not found and specifically asked
@@ -320,7 +596,7 @@ def get_image_vulnerabilities(user_id, image_id, force_refresh=False, vendor_onl
         img = db.query(Image).get((image_id, user_id))
         vulns = []
         if not img:
-            abort(404)
+            return make_response_error('Image not found', in_httpcode=404), 404
         else:
             if force_refresh:
                 log.info('Forcing refresh of vulnerabiltiies for {}/{}'.format(user_id, image_id))
@@ -330,7 +606,7 @@ def get_image_vulnerabilities(user_id, image_id, force_refresh=False, vendor_onl
                 except Exception as e:
                     log.exception('Error refreshing cve matches for image {}/{}'.format(user_id, image_id))
                     db.rollback()
-                    abort(Response('Error refreshing vulnerability listing for image.', 500))
+                    return make_response_error('Error refreshing vulnerability listing for image.', in_httpcode=500)
 
                 db = get_session()
                 db.refresh(img)
@@ -345,19 +621,28 @@ def get_image_vulnerabilities(user_id, image_id, force_refresh=False, vendor_onl
             if not have_vulnerabilities_for(ns):
                 warns = ['No vulnerability data available for image distro: {}'.format(ns.namespace_name)]
 
+        # select the nvd class once and be done
+        _nvd_cls, _cpe_cls = select_nvd_classes(db)
 
         rows = []
         for vuln in vulns:
-            # if vuln.vulnerability.fixed_in:
-            #     fixes_in = filter(lambda x: x.name == vuln.pkg_name or x.name == vuln.package.normalized_src_pkg,
-            #            vuln.vulnerability.fixed_in)
-            #     fix_available_in = fixes_in[0].version if fixes_in else 'None'
-            # else:
-            #     fix_available_in = 'None'
-
             # Skip the vulnerability if the vendor_only flag is set to True and the issue won't be addressed by the vendor
             if vendor_only and vuln.fix_has_no_advisory():
                 continue
+
+            # rennovation this for new CVSS references
+            cves = ''
+            nvd_list = []
+            all_data = {'nvd_data': nvd_list, 'vendor_data': []}
+            nvd_records = vuln.vulnerability.get_nvd_vulnerabilities(_nvd_cls=_nvd_cls, _cpe_cls=_cpe_cls)
+            for nvd_record in nvd_records:
+                nvd_list.extend(nvd_record.get_cvss_data_nvd())
+
+            cves = json.dumps(all_data)
+
+            #cves = ''
+            #if vuln.vulnerability.additional_metadata:
+            #    cves = ' '.join(vuln.vulnerability.additional_metadata.get('cves', []))
 
             rows.append([
                 vuln.vulnerability_id,
@@ -373,6 +658,7 @@ def get_image_vulnerabilities(user_id, image_id, force_refresh=False, vendor_onl
                 vuln.vulnerability.namespace_name,
                 vuln.pkg_name,
                 vuln.package.fullversion,
+                cves,
                 ]
             )
 
@@ -391,29 +677,45 @@ def get_image_vulnerabilities(user_id, image_id, force_refresh=False, vendor_onl
 
         cpe_vuln_listing = []
         try:
-            all_cpe_matches = db.query(ImageCpe,CpeVulnerability).filter(ImageCpe.image_id==image_id).filter(ImageCpe.name==CpeVulnerability.name).filter(ImageCpe.version==CpeVulnerability.version)
+            all_cpe_matches = img.cpe_vulnerabilities(_nvd_cls=_nvd_cls, _cpe_cls=_cpe_cls)
+            
             if not all_cpe_matches:
                 all_cpe_matches = []
 
+            cpe_hashes = {}
+            api_endpoint = None
             for image_cpe, vulnerability_cpe in all_cpe_matches:
+                link = vulnerability_cpe.parent.link
+                if not link:
+                    if not api_endpoint:
+                        api_endpoint = get_service_endpoint('apiext').strip('/')
+                    link = '{}/query/vulnerabilities?id={}'.format(api_endpoint, vulnerability_cpe.vulnerability_id)
+
                 cpe_vuln_el = {
                     'vulnerability_id': vulnerability_cpe.vulnerability_id,
-                    'severity': vulnerability_cpe.severity,
-                    'link': vulnerability_cpe.link,
+                    'severity': vulnerability_cpe.parent.severity,
+                    'link': link,
                     'pkg_type': image_cpe.pkg_type,
                     'pkg_path': image_cpe.pkg_path,
                     'name': image_cpe.name,
                     'version': image_cpe.version,
                     'cpe': image_cpe.get_cpestring(),
+                    'cpe23': image_cpe.get_cpe23string(),
                     'feed_name': vulnerability_cpe.feed_name,
                     'feed_namespace': vulnerability_cpe.namespace_name,
+                    'nvd_data': vulnerability_cpe.parent.get_cvss_data_nvd(),
+                    'vendor_data': vulnerability_cpe.parent.get_cvss_data_vendor()
                 }
-                cpe_vuln_listing.append(cpe_vuln_el)
+                cpe_hash = hashlib.sha256(utils.ensure_bytes(json.dumps(cpe_vuln_el))).hexdigest()
+                if not cpe_hashes.get(cpe_hash, False):
+                    cpe_vuln_listing.append(cpe_vuln_el)
+                    cpe_hashes[cpe_hash] = True
         except Exception as err:
             log.warn("could not fetch CPE matches - exception: " + str(err))
 
         report = LegacyVulnerabilityReport.from_dict(vuln_listing)
         resp = ImageVulnerabilityListing(user_id=user_id, image_id=image_id, legacy_report=report, cpe_report=cpe_vuln_listing)
+
         return resp.to_dict()
     except HTTPException:
         db.rollback()
@@ -421,23 +723,24 @@ def get_image_vulnerabilities(user_id, image_id, force_refresh=False, vendor_onl
     except Exception as e:
         log.exception('Error checking image {}, {} for vulnerabiltiies. Rolling back'.format(user_id, image_id))
         db.rollback()
-        abort(500)
+        return make_response_error(e, in_httpcode=500), 500
     finally:
         db.close()
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def ingress_image(ingress_request):
     """
     :param ingress_request json object specifying the identity of the image to sync
     :return: status result for image load
     """
-    if not connexion.request.is_json:
-        abort(400)
 
     req = ImageIngressRequest.from_dict(ingress_request)
     try:
         # Try this synchronously for now to see how slow it really is
-        t = ImageLoadTask(req.user_id, req.image_id, url=req.fetch_url)
+        conn_timeout = ApiRequestContextProxy.get_service().configuration.get('catalog_client_conn_timeout', DEFAULT_CACHE_CONN_TIMEOUT)
+        read_timeout = ApiRequestContextProxy.get_service().configuration.get('catalog_client_read_timeout', DEFAULT_CACHE_READ_TIMEOUT)
+        t = ImageLoadTask(req.user_id, req.image_id, url=req.fetch_url, content_conn_timeout=conn_timeout, content_read_timeout=read_timeout)
         result = t.execute()
         resp = ImageIngressResponse()
         if not result:
@@ -447,9 +750,11 @@ def ingress_image(ingress_request):
             resp.status = 'loaded'
         return resp.to_dict(), 200
     except Exception as e:
-        abort(500, 'Internal error processing image analysis import')
+        log.exception('Error loading image into policy engine')
+        return make_response_error(e,in_httpcode=500), 500
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def validate_bundle(policy_bundle):
     """
     Performs a validation of the given policy bundle and either returns 200 OK with a status message in the response indicating pass/fail and any validation errors.
@@ -478,9 +783,10 @@ def validate_bundle(policy_bundle):
         raise
     except Exception as e:
         log.exception('Failed processing bundle evaluation: {}'.format(e))
-        abort(Response('Unexpected internal error', 500))
+        return make_response_error(e, in_httpcode=500), 500
 
 
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
 def describe_policy():
     """
     Return a dictionary/json description of the set of gates available and triggers.
@@ -524,7 +830,7 @@ def describe_policy():
 
                 params = t._parameters()
                 if params:
-                    param_list = sorted(params.values(), key=lambda x: x.sort_order)
+                    param_list = sorted(list(params.values()), key=lambda x: x.sort_order)
                     for param in param_list:
                         tps = TriggerParamSpec()
                         tps.name = param.name
@@ -554,4 +860,422 @@ def describe_policy():
 
     except Exception as e:
         log.exception('Error describing gate system')
-        abort(500, 'Internal error describing gate configuration')
+        return make_response_error(e, in_httpcode=500), 500
+
+def _get_imageId_to_record(userId, dbsession=None):
+    imageId_to_record = {}
+
+    tag_re = re.compile("([^/]+)/([^:]+):(.*)")
+
+    imagetags = db_catalog_image.get_all_tagsummary(userId, session=dbsession)
+    fulltags = {}
+    tag_history = {}
+    for x in imagetags:
+        if x['imageId'] not in tag_history:
+            tag_history[x['imageId']] = []
+
+        registry, repo, tag = tag_re.match(x['fulltag']).groups()
+
+        if x['tag_detected_at']:
+            tag_detected_at = datetime.datetime.utcfromtimestamp(float(int(x['tag_detected_at']))).isoformat() +'Z'
+        else:
+            tag_detected_at = 0
+
+        tag_el = {
+            'registry': registry,
+            'repo': repo,
+            'tag': tag,
+            'fulltag': x['fulltag'],
+            'tag_detected_at': tag_detected_at,
+        }
+        tag_history[x['imageId']].append(tag_el)
+
+        if x['imageId'] not in imageId_to_record:
+            if x['analyzed_at']:
+                analyzed_at = datetime.datetime.utcfromtimestamp(float(int(x['analyzed_at']))).isoformat() +'Z'
+            else:
+                analyzed_at = 0
+
+            imageId_to_record[x['imageId']] = {
+                'imageDigest': x['imageDigest'],
+                'imageId': x['imageId'],
+                'analyzed_at': analyzed_at,
+                'tag_history': tag_history[x['imageId']],
+            }
+
+    return(imageId_to_record)
+
+
+def query_images_by_package(dbsession, request_inputs):
+    user_auth = request_inputs['auth']
+    method = request_inputs['method']
+    params = request_inputs['params']
+    userId = request_inputs['userId']
+
+    return_object = {}
+    httpcode = 500
+
+    pkg_name = request_inputs.get('params', {}).get('name', None)
+    pkg_version = request_inputs.get('params', {}).get('version', None)
+    pkg_type = request_inputs.get('params', {}).get('package_type', None)
+
+    ret_hash = {}
+    pkg_hash = {}
+    try:
+        ipm_query = dbsession.query(ImagePackage).filter(ImagePackage.name==pkg_name).filter(ImagePackage.image_user_id==userId)
+        cpm_query = dbsession.query(ImageCpe).filter(func.lower(ImageCpe.name)==func.lower(pkg_name)).filter(ImageCpe.image_user_id==userId)
+
+        if pkg_version and pkg_version != 'None':
+            ipm_query = ipm_query.filter(or_(ImagePackage.version==pkg_version, ImagePackage.fullversion==pkg_version))
+            cpm_query = cpm_query.filter(ImageCpe.version==pkg_version)
+        if pkg_type and pkg_type != 'None':
+            ipm_query = ipm_query.filter(ImagePackage.pkg_type==pkg_type)
+            cpm_query = cpm_query.filter(ImageCpe.pkg_type==pkg_type)
+
+        image_package_matches = ipm_query
+        cpe_package_matches = cpm_query
+
+        #ipm_dbfilter = {'name': pkg_name}
+        #cpm_dbfilter = {'name': pkg_name}
+
+        #if pkg_version and pkg_version != 'None':
+        #    ipm_dbfilter['version'] = pkg_version
+        #    cpm_dbfilter['version'] = pkg_version
+        #if pkg_type and pkg_type != 'None':
+        #    ipm_dbfilter['pkg_type'] = pkg_type
+        #    cpm_dbfilter['pkg_type'] = pkg_type
+
+        #image_package_matches = dbsession.query(ImagePackage).filter_by(**ipm_dbfilter).all()
+        #cpe_package_matches = dbsession.query(ImageCpe).filter_by(**cpm_dbfilter).all()
+
+        if image_package_matches or cpe_package_matches:
+            imageId_to_record = _get_imageId_to_record(userId, dbsession=dbsession)
+
+            for image in image_package_matches:
+                imageId = image.image_id
+                if imageId not in ret_hash:
+                    ret_hash[imageId] = {'image': imageId_to_record.get(imageId, {}), 'packages': []}
+                    pkg_hash[imageId] = {}
+
+                pkg_el = {
+                    'name': image.name,
+                    'version': image.fullversion,
+                    'type': image.pkg_type,
+                }
+                phash = hashlib.sha256(json.dumps(pkg_el).encode('utf-8')).hexdigest()
+                if not pkg_hash[imageId].get(phash, False):
+                    ret_hash[imageId]['packages'].append(pkg_el)
+                pkg_hash[imageId][phash] = True
+
+            for image in cpe_package_matches:
+                imageId = image.image_id
+                if imageId not in ret_hash:
+                    ret_hash[imageId] = {'image': imageId_to_record.get(imageId, {}), 'packages': []}
+                    pkg_hash[imageId] = {}
+
+                pkg_el = {
+                    'name': image.name,
+                    'version': image.version,
+                    'type': image.pkg_type,
+                }
+                phash = hashlib.sha256(json.dumps(pkg_el).encode('utf-8')).hexdigest()
+                if not pkg_hash[imageId].get(phash, False):
+                    ret_hash[imageId]['packages'].append(pkg_el)
+                pkg_hash[imageId][phash] = True
+
+        matched_images = list(ret_hash.values())
+        return_object = {
+            'matched_images': matched_images
+        }            
+        httpcode = 200
+    except Exception as err:
+        log.error("{}".format(err))
+        return_object = make_response_error(err, in_httpcode=httpcode)
+
+    return(return_object, httpcode)
+
+
+advisory_cache = {}
+
+
+def check_no_advisory(image):
+    phash = hashlib.sha256(json.dumps([image.pkg_name, image.pkg_version, image.vulnerability_namespace_name]).encode('utf-8')).hexdigest()
+    if phash not in advisory_cache:
+        advisory_cache[phash] = image.fix_has_no_advisory()
+
+    return(advisory_cache.get(phash))
+
+
+def query_images_by_vulnerability(dbsession, request_inputs):
+    method = request_inputs['method']
+    params = request_inputs['params']
+    userId = request_inputs['userId']
+
+    return_object = {}
+    httpcode = 500
+
+    id = request_inputs.get('params', {}).get('vulnerability_id', None)
+    severity_filter = request_inputs.get('params', {}).get('severity', None)
+    namespace_filter = request_inputs.get('params', {}).get('namespace', None)
+    affected_package_filter = request_inputs.get('params', {}).get('affected_package', None)
+    vendor_only = request_inputs.get('params', {}).get('vendor_only', True)
+
+    ret_hash = {}
+    pkg_hash = {}
+    try:
+        start = time.time()
+        image_package_matches = []
+        image_cpe_matches = []
+        image_cpe_vlndb_matches = []
+
+        (_nvd_cls, _cpe_cls) = select_nvd_classes(dbsession)
+
+        ipm_query = dbsession.query(ImagePackageVulnerability).filter(ImagePackageVulnerability.vulnerability_id==id).filter(ImagePackageVulnerability.pkg_user_id==userId)
+        icm_query = dbsession.query(ImageCpe,_cpe_cls).filter(_cpe_cls.vulnerability_id==id).filter(func.lower(ImageCpe.name)==_cpe_cls.name).filter(ImageCpe.image_user_id==userId).filter(ImageCpe.version==_cpe_cls.version)
+        icm_vulndb_query = dbsession.query(ImageCpe, VulnDBCpe).filter(
+            VulnDBCpe.vulnerability_id == id,
+            func.lower(ImageCpe.name) == VulnDBCpe.name,
+            ImageCpe.image_user_id == userId,
+            ImageCpe.version == VulnDBCpe.version,
+            VulnDBCpe.is_affected.is_(True)
+        )
+
+        if severity_filter:
+            ipm_query = ipm_query.filter(ImagePackageVulnerability.vulnerability.has(severity=severity_filter))
+            icm_query = icm_query.filter(_cpe_cls.parent.has(severity=severity_filter))  # might be slower than join
+            icm_vulndb_query = icm_vulndb_query.filter(_cpe_cls.parent.has(severity=severity_filter))  # might be slower than join
+        if namespace_filter:
+            ipm_query = ipm_query.filter(ImagePackageVulnerability.vulnerability_namespace_name==namespace_filter)
+            icm_query = icm_query.filter(_cpe_cls.namespace_name==namespace_filter)
+            icm_vulndb_query = icm_vulndb_query.filter(VulnDBCpe.namespace_name == namespace_filter)
+        if affected_package_filter:
+            ipm_query = ipm_query.filter(ImagePackageVulnerability.pkg_name==affected_package_filter)
+            icm_query = icm_query.filter(func.lower(ImageCpe.name)==func.lower(affected_package_filter))
+            icm_vulndb_query = icm_vulndb_query.filter(func.lower(ImageCpe.name) == func.lower(affected_package_filter))
+
+        image_package_matches = ipm_query#.all()
+        image_cpe_matches = icm_query#.all()
+        image_cpe_vlndb_matches = icm_vulndb_query
+
+        log.debug("QUERY TIME: {}".format(time.time() - start))
+
+        start = time.time()
+        if image_package_matches or image_cpe_matches or image_cpe_vlndb_matches:
+            imageId_to_record = _get_imageId_to_record(userId, dbsession=dbsession)
+            
+            start = time.time()
+            for image in image_package_matches:
+                if vendor_only and check_no_advisory(image):
+                    continue
+
+                imageId = image.pkg_image_id
+                if imageId not in ret_hash:
+                    ret_hash[imageId] = {'image': imageId_to_record.get(imageId, {}), 'vulnerable_packages': []}
+                    pkg_hash[imageId] = {}
+
+                pkg_el = {
+                    'name': image.pkg_name,
+                    'version': image.pkg_version,
+                    'type': image.pkg_type,
+                    'namespace': image.vulnerability_namespace_name,
+                    'severity': image.vulnerability.severity,
+                }
+
+                ret_hash[imageId]['vulnerable_packages'].append(pkg_el)
+            log.debug("IMAGEOSPKG TIME: {}".format(time.time() - start))
+
+            for cpe_matches in [image_cpe_matches, image_cpe_vlndb_matches]:
+                start = time.time()
+                for image_cpe, vulnerability_cpe in cpe_matches:
+                    imageId = image_cpe.image_id
+                    if imageId not in ret_hash:
+                        ret_hash[imageId] = {'image': imageId_to_record.get(imageId, {}), 'vulnerable_packages': []}
+                        pkg_hash[imageId] = {}
+                    pkg_el = {
+                        'name': image_cpe.name,
+                        'version': image_cpe.version,
+                        'type': image_cpe.pkg_type,
+                        'namespace': "{}".format(vulnerability_cpe.namespace_name),
+                        'severity': "{}".format(vulnerability_cpe.parent.severity),
+                    }
+                    phash = hashlib.sha256(json.dumps(pkg_el).encode('utf-8')).hexdigest()
+                    if not pkg_hash[imageId].get(phash, False):
+                        ret_hash[imageId]['vulnerable_packages'].append(pkg_el)
+                    pkg_hash[imageId][phash] = True
+
+                log.debug("IMAGECPEPKG TIME: {}".format(time.time() - start))
+
+        start = time.time()
+        vulnerable_images = list(ret_hash.values())
+        return_object = {
+            'vulnerable_images': vulnerable_images
+        }
+        log.debug("RESP TIME: {}".format(time.time() - start))
+        httpcode = 200
+
+    except Exception as err:
+        log.error("{}".format(err))
+        return_object = make_response_error(err, in_httpcode=httpcode)
+
+    return(return_object, httpcode)
+
+
+def query_vulnerabilities(dbsession, request_inputs):
+    user_auth = request_inputs['auth']
+    method = request_inputs['method']
+    params = request_inputs['params']
+    userId = request_inputs['userId']
+
+    return_object = []
+    httpcode = 500
+
+    id = request_inputs.get('params', {}).get('id', None)
+    package_name_filter = request_inputs.get('params', {}).get('affected_package', None)
+    package_version_filter = request_inputs.get('params', {}).get('affected_package_version', None)
+    vulnerability_exists = False
+
+    try:
+        return_el_template = {
+            'id': None,
+            'namespace': None,
+            'severity': None,
+            'link': None,
+            'affected_packages': None,
+            'description': None,
+            'references': None,
+            'nvd_data': None,
+            'vendor_data': None
+        }
+
+        pn_hash = {}
+
+        # order_by ascending timestamp will result in dedup hash having only the latest information stored for return, if there are duplicate records for NVD
+        (_nvd_cls, _cpe_cls) = select_nvd_classes(dbsession)
+
+        vulnerabilities = dbsession.query(_nvd_cls).filter(_nvd_cls.name==id).order_by(asc(_nvd_cls.created_at)).all()
+        vulnerabilities.extend(
+            dbsession.query(VulnDBMetadata).filter(VulnDBMetadata.name == id).order_by(asc(VulnDBMetadata.created_at)).all()
+        )
+
+        if vulnerabilities:
+            dedupped_return_hash = {}
+            vulnerability_exists = True
+            api_endpoint = None
+            for vulnerability in vulnerabilities:
+                link = vulnerability.link
+                if not link:
+                    if not api_endpoint:
+                        api_endpoint = get_service_endpoint('apiext').strip('/')
+                    link = '{}/query/vulnerabilities?id={}'.format(api_endpoint, vulnerability.name)
+
+                namespace_el = {}
+                namespace_el.update(return_el_template)
+                namespace_el['id'] = vulnerability.name
+                namespace_el['namespace'] = vulnerability.namespace_name
+                namespace_el['severity'] = vulnerability.severity
+                namespace_el['link'] = link
+                namespace_el['affected_packages'] = []
+                namespace_el['description'] = vulnerability.description
+                namespace_el['references'] = vulnerability.references
+                namespace_el['nvd_data'] = vulnerability.get_cvss_data_nvd()
+                namespace_el['vendor_data'] = vulnerability.get_cvss_data_vendor()
+
+                for v_pkg in vulnerability.vulnerable_cpes:
+                    if (not package_name_filter or package_name_filter == v_pkg.name) and (not package_version_filter or package_version_filter == v_pkg.version):
+                        pkg_el = {
+                            'name': v_pkg.name,
+                            'version': v_pkg.version,
+                            'type': '*',
+                        }
+                        namespace_el['affected_packages'].append(pkg_el)
+
+                if not package_name_filter or (package_name_filter and namespace_el['affected_packages']):
+                    dedupped_return_hash[namespace_el['id']] = namespace_el
+
+            return_object.extend(list(dedupped_return_hash.values()))
+
+        vulnerabilities = dbsession.query(Vulnerability).filter(Vulnerability.id==id).all()
+        if vulnerabilities:
+            for vulnerability in vulnerabilities:
+                namespace_el = {}
+                namespace_el.update(return_el_template)
+                namespace_el['id'] = vulnerability.id
+                namespace_el['namespace'] = vulnerability.namespace_name
+                namespace_el['severity'] = vulnerability.severity
+                namespace_el['link'] = vulnerability.link
+                namespace_el['affected_packages'] = []
+
+                namespace_el['nvd_data'] = []
+                namespace_el['vendor_data'] = []
+
+                for nvd_record in vulnerability.get_nvd_vulnerabilities(_nvd_cls=_nvd_cls, _cpe_cls=_cpe_cls):
+                    namespace_el['nvd_data'].extend(nvd_record.get_cvss_data_nvd())
+                
+                for v_pkg in vulnerability.fixed_in:
+                    if (not package_name_filter or package_name_filter == v_pkg.name) and (not package_version_filter or package_version_filter == v_pkg.version):
+                        pkg_el = {
+                            'name': v_pkg.name,
+                            'version': v_pkg.version,
+                            'type': v_pkg.version_format,
+                        }
+                        if not v_pkg.version or v_pkg.version.lower() == 'none':
+                            pkg_el['version'] = '*'
+
+                        namespace_el['affected_packages'].append(pkg_el)
+
+                if not package_name_filter or (package_name_filter and namespace_el['affected_packages']):
+                    return_object.append(namespace_el)
+
+        httpcode = 200
+            
+    except Exception as err:
+        log.error("{}".format(err))
+        return_object = make_response_error(err, in_httpcode=httpcode)
+
+    return(return_object, httpcode)
+
+
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
+def query_vulnerabilities_get(id=None, affected_package=None, affected_package_version=None):
+    try:
+        session = get_session()
+        request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={'id': id, 'affected_package': affected_package, 'affected_package_version': affected_package_version})
+        return_object, httpcode = query_vulnerabilities(session, request_inputs)
+    except Exception as err:
+        httpcode = 500
+        return_object = str(err)
+    finally:
+        session.close()
+
+    return (return_object, httpcode)    
+
+
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
+def query_images_by_package_get(user_id, name=None, version=None, package_type=None):
+
+    try:
+        session = get_session()
+        request_inputs = anchore_engine.apis.do_request_prep(connexion.request, default_params={'name': name, 'version': version, 'package_type': package_type})
+        return_object, httpcode = query_images_by_package(session, request_inputs)
+    except Exception as err:
+        httpcode = 500
+        return_object = str(err)
+    finally:
+        session.close()
+
+    return (return_object, httpcode)    
+
+
+@authorizer.requires_account(with_types=INTERNAL_SERVICE_ALLOWED)
+def query_images_by_vulnerability_get(user_id, vulnerability_id=None, severity=None, namespace=None, affected_package=None, vendor_only=True):
+    try:
+        session = get_session()
+        request_inputs = apis.do_request_prep(connexion.request, default_params={'vulnerability_id': vulnerability_id, 'severity': severity, 'namespace': namespace, 'affected_package': affected_package, 'vendor_only': vendor_only})
+        return_object, httpcode = query_images_by_vulnerability(session, request_inputs)
+    except Exception as err:
+        httpcode = 500
+        return_object = str(err)
+    finally:
+        session.close()
+
+    return (return_object, httpcode)

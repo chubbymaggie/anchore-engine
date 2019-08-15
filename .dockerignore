@@ -1,4 +1,6 @@
-.idea*
-.idea/*
-.git*
-.git/*
+.idea
+.git
+.circleci
+.tox
+.pytest*
+

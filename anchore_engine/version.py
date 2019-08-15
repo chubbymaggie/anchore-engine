@@ -1,2 +1,2 @@
-version="0.2.2dev"
-db_version="0.0.7"
+version="0.5.0-dev"
+db_version="0.0.11"
